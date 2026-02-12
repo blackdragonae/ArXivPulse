@@ -107,3 +107,7 @@ GitHub Actions is configured in `.github/workflows/ci.yml` to run on push and pu
 - Python compile checks
 - frontend JS syntax check
 - API smoke suite
+
+## License
+
+MIT. See `LICENSE`.
