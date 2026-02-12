@@ -20,6 +20,9 @@ tmp/
 downloads/
 reports/
 server.log
+config.local.json
+*.local.json
+*.env
 
 # OS/editor
 .DS_Store

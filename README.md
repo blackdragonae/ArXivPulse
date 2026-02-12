@@ -50,6 +50,25 @@ Alternative:
 
 `http://localhost:8001`
 
+## Personal Config (Private)
+
+Use this pattern to keep personal paths/tokens out of Git:
+
+- `config.json` is the public/shared base config.
+- `config.local.json` is your private override (git-ignored).
+- The app loads `config.json`, then overrides with `config.local.json`.
+- UI Settings saves to `config.local.json` by default.
+
+Create your local file:
+
+```bash
+cp config.example.json config.local.json
+```
+
+Then edit `config.local.json` with your local values (e.g. Obsidian vault path, Notion token/db id).
+
+Optional: set `ARXIVC_LOCAL_CONFIG_FILE` if you want the private override file in a custom path.
+
 ## Validation Commands
 
 - Smoke checks:
