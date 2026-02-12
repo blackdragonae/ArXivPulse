@@ -1,6 +1,8 @@
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
 
-import fitz  # PyMuPDF
-import io
 import base64
 import os
 from typing import List, Dict
@@ -12,6 +14,8 @@ def _extract_images_cached(abs_pdf_path: str, max_images: int, mtime: float):
     Internal cached extractor.
     Returns tuples to keep cached values immutable.
     """
+    if fitz is None:
+        return tuple()
     records = []
     doc = fitz.open(abs_pdf_path)
     img_count = 0
