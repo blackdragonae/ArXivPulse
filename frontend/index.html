@@ -1,0 +1,1935 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArXiv Pulse</title>
+    <script>
+        window.onerror = function (msg, url, lineNo, columnNo, error) {
+            console.error("Global Error:", msg, error);
+            alert("App Error: " + msg + "\nLine: " + lineNo);
+            return false;
+        };
+    </script>
+    <link rel="stylesheet" href="style.css?v=95">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <i class="fa-solid fa-atom fa-spin"></i>
+                <h1>ArXiv Pulse</h1>
+            </div>
+            <div class="actions">
+                <span id="batchDateDisplay"
+                    style="margin-right: 1rem; color: var(--text-muted); font-size: 0.9rem;"></span>
+                <span id="schedulerLeaderBadge" title="Scheduler leader status"
+                    style="display:none; margin-right:0.6rem; align-items:center; gap:0.35rem; border:1px solid rgba(255,255,255,0.2); border-radius:999px; padding:0.2rem 0.55rem; font-size:0.75rem; color:var(--text-muted); cursor:pointer;">
+                    <i class="fa-solid fa-wave-square"></i>
+                    Scheduler: --
+                </span>
+                <span id="healthBanner" class="health-banner" title="Index freshness and last fetch">
+                    Index ok • Last fetch: --
+                </span>
+                <input type="date" id="dateInput"
+                    style="background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; padding: 0.5rem; border-radius: 6px; margin-right: 0.5rem; font-family: inherit;">
+                <button id="fetchBtn" class="btn-primary">
+                    <i class="fa-solid fa-cloud-arrow-down"></i>
+                    Fetch New
+                </button>
+                <button id="dailyFetchBtn" class="action-btn" title="Run Daily Batch (M-F)" onclick="runDailyFetch()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-left: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-calendar-check"></i>
+                </button>
+                <button id="dayRunBtn" class="action-btn" title="Run my day" onclick="runMyDay()"
+                    style="border: 1px solid rgba(34, 197, 94, 0.35); color:#4ade80; border-radius: 6px; margin-left: 0.35rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-play"></i>
+                </button>
+                <label style="display:flex; align-items:center; gap:0.4rem; margin-left:0.35rem; font-size:0.8rem; color:var(--text-muted);">
+                    <input type="checkbox" id="dailyFetchForceCheck">
+                    Force
+                </label>
+                <button id="smartRankBtn" class="btn-secondary"
+                    style="background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: var(--text-muted); margin-right: 0.5rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; transition: all 0.3s;">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i> Smart Sort
+                </button>
+                <button id="toggleStatsBtn" class="action-btn" title="Galaxy View"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-chart-pie"></i>
+                </button>
+                <button id="morningBriefBtn" class="action-btn" title="Morning Brief (AI)"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-mug-hot"></i>
+                </button>
+                <button id="digestBtn" class="action-btn" title="Auto-Digest Inbox" onclick="openDigestModal()"
+                    style="position:relative; border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#38bdf8;">
+                    <i class="fa-solid fa-inbox"></i>
+                    <span id="digestBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#38bdf8; color:#0f172a; padding:0 4px;">0</span>
+                </button>
+                <button id="unifiedInboxBtn" class="action-btn" title="Unified Inbox" onclick="openUnifiedInboxModal()"
+                    style="position:relative; border: 1px solid rgba(251, 191, 36, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#fbbf24;">
+                    <i class="fa-solid fa-layer-group"></i>
+                    <span id="unifiedInboxBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#f59e0b; color:#0f172a; padding:0 4px;">0</span>
+                </button>
+                <button id="readingPlanBtn" class="action-btn" title="Reading Plan" onclick="openReadingPlanModal()"
+                    style="border: 1px solid rgba(14, 165, 233, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#7dd3fc;">
+                    <i class="fa-solid fa-list-check"></i>
+                </button>
+                <button id="versionUpdatesBtn" class="action-btn" title="Version Updates" onclick="openVersionUpdatesModal()"
+                    style="position:relative; border: 1px solid rgba(14, 165, 233, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#60a5fa;">
+                    <i class="fa-solid fa-code-branch"></i>
+                    <span id="versionUpdatesBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#60a5fa; color:#0f172a; padding:0 4px;">0</span>
+                </button>
+                <button id="alertsBtn" class="action-btn" title="Smart Alerts" onclick="openAlertsModal()"
+                    style="position:relative; border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#f59e0b;">
+                    <i class="fa-solid fa-bell"></i>
+                    <span id="alertsBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#ef4444; color:white; padding:0 4px;">0</span>
+                </button>
+                <button id="mentionsBtn" class="action-btn" title="Mentions" onclick="openMentionsModal()"
+                    style="position:relative; border: 1px solid rgba(14, 165, 233, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#38bdf8;">
+                    <i class="fa-solid fa-at"></i>
+                    <span id="mentionsBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#ef4444; color:white; padding:0 4px;">0</span>
+                </button>
+                <button id="followupsBtn" class="action-btn" title="Follow-ups" onclick="openFollowupsModal()"
+                    style="position:relative; border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#a5b4fc;">
+                    <i class="fa-solid fa-bell"></i>
+                    <span id="followupsBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#ef4444; color:white; padding:0 4px;">0</span>
+                </button>
+                <button id="changeSummaryBtn" class="action-btn" title="What changed since last visit"
+                    onclick="openChangeSummaryModal()"
+                    style="position:relative; border: 1px solid rgba(167, 139, 250, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#a78bfa;">
+                    <i class="fa-solid fa-clock-rotate-left"></i>
+                    <span id="changeSummaryBadge"
+                        style="position:absolute; top:-6px; right:-6px; min-width:18px; height:18px; border-radius:9px; display:none; align-items:center; justify-content:center; font-size:0.7rem; background:#a78bfa; color:#1f2937; padding:0 4px;">0</span>
+                </button>
+                <button id="trailBtn" class="action-btn" title="Research Trail" onclick="openTrailModal()"
+                    style="border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#60a5fa;">
+                    <i class="fa-solid fa-route"></i>
+                </button>
+                <button id="agentsBtn" class="action-btn" title="Saved Search Agents" onclick="openSearchAgentsModal()"
+                    style="border: 1px solid rgba(34, 197, 94, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color:#22c55e;">
+                    <i class="fa-solid fa-satellite-dish"></i>
+                </button>
+                <button id="agentBtn" class="action-btn" title="Deep Research Agent" onclick="openAgentModal()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #00ff00; border-color: rgba(0,255,0,0.3);">
+                    <i class="fa-solid fa-robot"></i>
+                </button>
+                <button id="surveyBtn" class="action-btn" title="Auto-Survey Agent" onclick="openSurveyModal()"
+                    style="border: 1px solid rgba(236, 72, 153, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #ec4899;">
+                    <i class="fa-solid fa-scroll"></i>
+                </button>
+                <button id="libChatBtn" class="action-btn" title="Chat with Library" onclick="openLibraryChatModal()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #3b82f6; border-color: rgba(59,130,246,0.3);">
+                    <i class="fa-solid fa-comments"></i>
+                </button>
+                <button id="discoverBtn" class="action-btn" title="Discover New Papers" onclick="openDiscoverModal()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #facc15; border-color: rgba(250,204,21,0.3);">
+                    <i class="fa-solid fa-lightbulb"></i>
+                </button>
+                <button id="lineageBtn" class="action-btn" title="Method Lineage" onclick="openLineageModal()"
+                    style="border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #34d399;">
+                    <i class="fa-solid fa-sitemap"></i>
+                </button>
+                <button id="settingsBtn" class="action-btn" title="Feed Tuner" onclick="openSettings()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-left: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-gear"></i>
+                </button>
+            </div>
+            <div class="nav-group" style="display:flex; gap:0.6rem; align-items:center;">
+                <div class="nav-item" onclick="setFilter('liked')">
+                    <i class="fa-solid fa-heart"></i> Favorites
+                </div>
+                <div class="nav-item" onclick="setFilter('bookmarked')">
+                    <i class="fa-solid fa-bookmark"></i> Reading List
+                </div>
+                <div class="nav-item" onclick="setFilter('dismissed')">
+                    <i class="fa-solid fa-trash"></i> Trash
+                </div>
+                <div class="nav-item" id="graphTabBtn" onclick="openGraphView()">
+                    <i class="fa-solid fa-circle-nodes"></i> Graph
+                </div>
+            </div>
+            <!-- Selection Toggle -->
+            <button id="selectionToggleBtn" class="action-btn" title="Toggle Selection Mode"
+                onclick="toggleSelectionMode()"
+                style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-left: auto; margin-right: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                <i class="fa-regular fa-square-check"></i> Select
+            </button>
+            <div class="search-container"
+                style="display:flex; align-items:center; gap:0.6rem; background: var(--card-bg); padding: 0.5rem 0.8rem; border-radius: 10px;">
+                <i class="fa-solid fa-magnifying-glass search-icon"></i>
+                <input type="text" id="searchInput" placeholder="Search papers..." list="recentSearchesList"
+                    style="border:none; outline:none; background:transparent; color:white; width: 200px;">
+                <span id="searchScopeBadge" class="scope-badge hidden"></span>
+                <span id="searchCacheBadge" class="scope-badge hidden" data-mode="cached">cached</span>
+                <div class="search-modes" role="tablist" aria-label="Search mode">
+                    <button class="search-chip active" data-mode="local" title="Filter current library">Local</button>
+                    <button class="search-chip" data-mode="semantic" title="AI semantic search">Semantic</button>
+                    <button class="search-chip" data-mode="global" title="Search entire arXiv">Global</button>
+                </div>
+                <button id="skimViewBtn" class="action-btn" title="Quick skim view" onclick="toggleSkimView()"
+                    style="border: 1px solid rgba(148,163,184,0.35); border-radius: 6px; width:auto; height:auto; padding: 0.5rem 1rem; color:#cbd5f5;">
+                    <i class="fa-solid fa-bars"></i>
+                </button>
+                <button id="threadsViewBtn" class="action-btn" title="Threads view" onclick="toggleThreadsView()"
+                    style="border: 1px solid rgba(148,163,184,0.35); border-radius: 6px; width:auto; height:auto; padding: 0.5rem 1rem; color:#cbd5f5;">
+                    <i class="fa-solid fa-layer-group"></i>
+                </button>
+                <!-- Galaxy Toggle -->
+                <button id="galaxyBtn" class="action-btn" title="Semantic Galaxy View" onclick="toggleGalaxyView()"
+                    style="border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; margin-left: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem;">
+                    <i class="fa-solid fa-atom"></i> Galaxy
+                </button>
+                <button id="conceptMapBtn" class="action-btn" title="Concept Knowledge Graph" onclick="openConceptMap()"
+                    style="border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 6px; margin-left: 0.5rem; width:auto; height:auto; padding: 0.5rem 1rem; color: #34d399;">
+                    <i class="fa-solid fa-project-diagram"></i> Map
+                </button>
+            </div>
+        </header>
+
+        <div id="dashboard" class="dashboard-container hidden">
+            <div class="chart-card">
+                <h4>Topic Distribution</h4>
+                <div style="height:200px; position:relative;">
+                    <canvas id="topicChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-card">
+                <h4>Activity Trend</h4>
+                <div style="height:200px; position:relative;">
+                    <canvas id="trendChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <main>
+            <button class="filter-chip status-chip active" data-status="new">New</button>
+            <button class="filter-chip status-chip" data-status="liked">Favorites</button>
+            <button class="filter-chip status-chip" data-status="dismissed">Dismissed</button>
+            <div id="favoritesSortBar" class="hidden"
+                style="display:flex; align-items:center; gap:0.5rem; margin-top:0.8rem; flex-wrap:wrap;">
+                <span style="font-size:0.85rem; color:var(--text-muted);">Favorites sort:</span>
+                <button class="filter-chip fav-sort-chip" data-sort="date">Date</button>
+                <button class="filter-chip fav-sort-chip" data-sort="matches">Matches</button>
+                <button class="filter-chip fav-sort-chip" data-sort="novelty">Novelty</button>
+                <button class="filter-chip fav-sort-chip" data-sort="ai">Auto IA</button>
+            </div>
+            <div id="savedViewsBar"
+                style="display:flex; align-items:center; gap:0.5rem; margin-top:0.8rem; flex-wrap:wrap;">
+                <span style="font-size:0.85rem; color:var(--text-muted);">Saved views:</span>
+                <div id="savedViewsChips" style="display:flex; gap:0.5rem; flex-wrap:wrap;"></div>
+                <button class="filter-chip" onclick="openSavedViewsModal()" style="border-style:dashed; opacity:0.8;">
+                    <i class="fa-solid fa-floppy-disk"></i> Save View
+                </button>
+            </div>
+    </div>
+
+    <!-- Smart Folders Section (Horizontal Scroll or just below filters) -->
+    <div id="smartFoldersContainer" class="smart-folders"
+        style="display:flex; gap:0.5rem; overflow-x:auto; padding-bottom:0.5rem; margin-top:1rem;">
+        <!-- Folders injected here -->
+        <button class="filter-chip" onclick="openCreateFolderModal()" style="border-style:dashed; opacity:0.7;">+
+            Collection</button>
+    </div>
+
+
+    <div id="loading" class="hidden">
+        <div class="loader"></div>
+        <p>Scanning the cosmos...</p>
+    </div>
+    <!-- Paper Grid -->
+    <div class="grid-container" id="paperGrid">
+        <!-- Papers will be injected here -->
+    </div>
+    <div id="paperLoadSentinel" class="hidden"
+        style="text-align:center; color:var(--text-muted); padding:0.75rem 0; font-size:0.9rem;"></div>
+
+    <!-- Chat Modal -->
+    <div id="chatModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal">
+            <div class="modal-header">
+                <h2>Chat with Paper</h2>
+                <button class="close-btn" onclick="closeChatModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="chat-container">
+                <div id="chatHistory" class="chat-history">
+                    <div class="chat-message system">
+                        <div class="message-content">
+                            Hello! I've read this paper. Ask me anything about it.
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-input-area">
+                    <input type="text" id="chatInput" placeholder="Ask a question..."
+                        onkeypress="handleChatInput(event)">
+                    <button class="send-btn" onclick="sendChat()"><i class="fas fa-paper-plane"></i></button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Structured Summary Modal -->
+    <div id="structureModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-list-check"></i> Paper Structure</h2>
+                <button class="close-btn" onclick="closeStructureModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div id="structureContent" style="display:flex; flex-direction:column; gap:0.75rem;">
+                    Loading...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Version History Modal -->
+    <div id="versionModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1100px; height: 86vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-code-branch"></i> Version History & Diff</h2>
+                <button class="close-btn" onclick="closeVersionModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body version-modal-body">
+                <div class="version-panel version-panel-left">
+                    <div id="versionPaperTitle" class="version-paper-title">Loading...</div>
+                    <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.6rem; flex-wrap:wrap;">
+                        <button class="btn-secondary" onclick="reloadVersionData()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-rotate-right"></i> Reload
+                        </button>
+                        <span id="versionFamilyMeta" style="font-size:0.82rem; color:var(--text-muted);"></span>
+                    </div>
+                    <div id="versionList" class="version-list">Loading versions...</div>
+                </div>
+                <div class="version-panel version-panel-right">
+                    <div class="version-controls">
+                        <div>
+                            <label style="font-size:0.82rem; color:var(--text-muted);">From</label>
+                            <select id="versionFromSelect"></select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.82rem; color:var(--text-muted);">To</label>
+                            <select id="versionToSelect"></select>
+                        </div>
+                        <div style="display:flex; gap:0.4rem; align-items:flex-end;">
+                            <button class="btn-secondary" onclick="swapVersionSelection()" style="padding:0.35rem 0.75rem;">
+                                <i class="fa-solid fa-right-left"></i>
+                            </button>
+                            <button class="btn-secondary" onclick="loadVersionDiff()" style="padding:0.35rem 0.75rem;">
+                                <i class="fa-solid fa-code-compare"></i> Diff
+                            </button>
+                        </div>
+                    </div>
+                    <div id="versionDiffSummary" class="version-diff-summary">Select versions to compare.</div>
+                    <div id="versionDiffFields" class="version-fields-grid"></div>
+                    <div>
+                        <div style="font-size:0.82rem; color:var(--text-muted); margin-bottom:0.35rem;">Abstract diff</div>
+                        <pre id="versionDiffText" class="version-diff-pre"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reading Status Modal -->
+    <div id="readingModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 720px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-book-open-reader"></i> Reading Status</h2>
+                <button class="close-btn" onclick="closeReadingModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.9rem;">
+                <div id="readingModalTitle" style="font-weight:600;"></div>
+                <div id="readingTimeline" class="reading-timeline">
+                    <span class="reading-step" data-step="queue">Queue</span>
+                    <span class="reading-step" data-step="reading">Reading</span>
+                    <span class="reading-step" data-step="done">Done</span>
+                </div>
+                <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                    <button class="btn-secondary" onclick="setReadingStatus('queue')">Queue</button>
+                    <button class="btn-secondary" onclick="setReadingStatus('reading')">Reading</button>
+                    <button class="btn-secondary" onclick="setReadingStatus('done')">Done</button>
+                </div>
+                <div>
+                    <label style="font-size:0.85rem; color:var(--text-muted);">Progress</label>
+                    <div style="display:flex; align-items:center; gap:0.6rem;">
+                        <input type="range" id="readingProgressInput" min="0" max="100" value="0" style="flex:1;">
+                        <span id="readingProgressLabel" style="min-width:48px; text-align:right;">0%</span>
+                    </div>
+                    <div class="reading-progress">
+                        <div id="readingProgressBar" class="reading-progress-bar" style="width:0%;"></div>
+                    </div>
+                </div>
+                <div class="reading-estimate">
+                    <div style="display:flex; align-items:center; justify-content:space-between;">
+                        <div style="font-size:0.85rem; color:var(--text-muted);">Estimated reading time</div>
+                        <button class="btn-secondary" onclick="estimateReadingTime(true)" style="padding:0.3rem 0.7rem;">
+                            <i class="fa-solid fa-hourglass-half"></i> Estimate
+                        </button>
+                    </div>
+                    <div id="readingEstimateValue" style="font-weight:600; margin-top:0.3rem;">Not estimated</div>
+                    <div id="readingEstimateMeta" style="font-size:0.8rem; color:var(--text-muted);"></div>
+                </div>
+                <div class="reading-questions">
+                    <div style="display:flex; align-items:center; justify-content:space-between;">
+                        <div style="font-size:0.85rem; color:var(--text-muted);">Guiding questions</div>
+                        <div style="display:flex; gap:0.4rem;">
+                            <button class="btn-secondary" onclick="loadReadingQuestions(false)" style="padding:0.3rem 0.6rem;">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i> Load
+                            </button>
+                            <button class="btn-secondary" onclick="loadReadingQuestions(true)" style="padding:0.3rem 0.6rem;">
+                                <i class="fa-solid fa-rotate"></i> Refresh
+                            </button>
+                        </div>
+                    </div>
+                    <div id="readingQuestionsList" style="margin-top:0.5rem; font-size:0.9rem; color:#cbd5e1;">
+                        No questions generated yet.
+                    </div>
+                </div>
+                <div style="display:flex; gap:0.6rem; justify-content:flex-end;">
+                    <button class="btn-secondary" onclick="saveReadingStatus()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reading Plan Modal -->
+    <div id="readingPlanModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 84vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-list-check"></i> Reading Plan</h2>
+                <button class="close-btn" onclick="closeReadingPlanModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.8rem; overflow-y:auto; height:100%;">
+                <div class="reading-plan-controls">
+                    <div>
+                        <label>Minutes</label>
+                        <input id="planTotalMinutes" type="number" min="10" max="360" value="60">
+                    </div>
+                    <div>
+                        <label>Max Items</label>
+                        <input id="planMaxItems" type="number" min="1" max="20" value="6">
+                    </div>
+                    <label><input id="planIncludeNew" type="checkbox" checked> New</label>
+                    <label><input id="planIncludeLiked" type="checkbox" checked> Favorites</label>
+                    <label><input id="planIncludeBookmarked" type="checkbox" checked> Bookmarked</label>
+                    <button class="btn-secondary" onclick="loadTodayReadingPlan(false)" style="padding:0.4rem 0.75rem;">
+                        <i class="fa-solid fa-calendar-day"></i> Today
+                    </button>
+                    <button class="btn-secondary" onclick="generateReadingPlan(true)" style="padding:0.4rem 0.75rem;">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i> Generate
+                    </button>
+                </div>
+                <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                    <label style="font-size:0.85rem; color:var(--text-muted);">History</label>
+                    <select id="readingPlanHistorySelect"
+                        style="min-width:220px; padding:0.45rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <option value="">Today</option>
+                    </select>
+                    <button class="btn-secondary" onclick="loadSelectedReadingPlanHistory()" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-folder-open"></i> Open
+                    </button>
+                </div>
+                <div id="readingPlanStatus" style="font-size:0.85rem; color:var(--text-muted);">Loading plan...</div>
+                <div id="readingPlanProgress" style="font-size:0.82rem; color:var(--text-muted);"></div>
+                <div id="readingPlanUndoBar" class="hidden"
+                    style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap; font-size:0.83rem; color:var(--text-muted);">
+                    <span id="readingPlanUndoText"></span>
+                    <button class="btn-secondary" onclick="undoLastReadingPlanAction()" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-rotate-left"></i> Undo
+                    </button>
+                </div>
+                <div id="readingPlanList" class="reading-plan-list">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Version Updates Modal -->
+    <div id="versionUpdatesModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-code-branch"></i> Version Updates Inbox</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="action-btn" onclick="loadVersionUpdatesInbox(true)" title="Refresh">
+                        <i class="fa-solid fa-rotate-right"></i> Refresh
+                    </button>
+                    <button class="close-btn" onclick="closeVersionUpdatesModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; display:flex; flex-direction:column; gap:0.7rem;">
+                <div style="display:flex; gap:0.55rem; align-items:center; flex-wrap:wrap;">
+                    <label style="font-size:0.84rem; color:var(--text-muted);">Scope</label>
+                    <select id="versionUpdatesScope"
+                        style="padding:0.45rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <option value="watchlist">Watchlist</option>
+                        <option value="liked">Favorites</option>
+                        <option value="bookmarked">Bookmarked</option>
+                        <option value="new">New</option>
+                    </select>
+                    <label style="font-size:0.84rem; color:var(--text-muted);">Since (days)</label>
+                    <input id="versionUpdatesSinceDays" type="number" min="1" max="180" value="30"
+                        style="width:90px; padding:0.45rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                    <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                        <input id="versionUpdatesIncludeTriaged" type="checkbox"> Show triaged
+                    </label>
+                    <button class="btn-secondary" onclick="loadVersionUpdatesInbox(true)" style="padding:0.35rem 0.75rem;">
+                        <i class="fa-solid fa-filter"></i> Apply
+                    </button>
+                </div>
+                <div id="versionUpdatesStatus" style="font-size:0.85rem; color:var(--text-muted);">Loading updates...</div>
+                <div id="versionUpdatesList" style="display:flex; flex-direction:column; gap:0.75rem;">
+                    Loading updates...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notes Modal -->
+    <div id="notesModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 820px; height: 80vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-note-sticky"></i> Notes</h2>
+                <div style="display:flex; gap:0.5rem;">
+                    <button class="action-btn" onclick="exportNotesToObsidian()" title="Export notes to Obsidian">
+                        <i class="fa-solid fa-file-export"></i>
+                    </button>
+                    <button class="close-btn" onclick="closeNotesModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.75rem; height:100%;">
+                <div id="notesModalTitle" style="font-weight:600;"></div>
+                <textarea id="notesInput" rows="10"
+                    style="flex:1; width:100%; padding:0.8rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0; resize:vertical;"
+                    placeholder="Write your notes here..."></textarea>
+                <div style="display:flex; align-items:center; justify-content:space-between;">
+                    <label style="display:flex; align-items:center; gap:0.45rem; font-size:0.9rem; color:var(--text-muted);">
+                        <input type="checkbox" id="weeklyPickToggle" onchange="toggleWeeklyPick(this.checked)">
+                        Weekly pick
+                    </label>
+                    <span id="weeklyPickStatus" style="font-size:0.82rem; color:var(--text-muted);"></span>
+                </div>
+                <div style="display:flex; gap:0.6rem; justify-content:flex-end;">
+                    <button class="btn-secondary" onclick="openLatestVersionDiffFromNotes()"><i class="fa-solid fa-code-branch"></i> Latest Diff</button>
+                    <button class="btn-secondary" onclick="openNotesHistoryModal()"><i class="fa-solid fa-clock-rotate-left"></i> History</button>
+                    <button class="btn-secondary" onclick="saveNotes()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                </div>
+                <div class="team-notes" style="background:rgba(255,255,255,0.02);">
+                    <div class="team-notes-header">Follow-up</div>
+                    <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                        <input type="number" id="followupDaysInput" min="1" value="7"
+                            style="width:90px; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <input type="text" id="followupNoteInput" placeholder="Optional note"
+                            style="flex:1; min-width:180px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <button class="btn-secondary" onclick="setFollowUp()"><i class="fa-solid fa-bell"></i> Remind</button>
+                    </div>
+                    <div id="followupStatus" style="font-size:0.82rem; color:var(--text-muted); margin-top:0.4rem;"></div>
+                </div>
+                <div class="team-notes">
+                    <div class="team-notes-header">Team notes</div>
+                    <div id="teamNotesList" class="team-notes-list">No comments yet.</div>
+                    <div class="team-notes-inputs">
+                        <input type="text" id="teamNoteAuthor" placeholder="Your name"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <textarea id="teamNoteBody" rows="3" placeholder="Write a comment and @mention teammates..."
+                            style="width:100%; padding:0.7rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0; resize:vertical;"></textarea>
+                        <div style="display:flex; justify-content:flex-end;">
+                            <button class="btn-secondary" onclick="addTeamNote()"><i class="fa-solid fa-paper-plane"></i> Post</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="team-notes" style="margin-top:0.6rem;">
+                    <div class="team-notes-header">Linked papers</div>
+                    <div id="paperLinksList" class="team-notes-list">No links yet.</div>
+                    <div class="team-notes-inputs">
+                        <input type="text" id="paperLinkTarget" placeholder="Paper ID or URL"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                            <select id="paperLinkRelation"
+                                style="flex:1; min-width:160px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                                <option value="extends">extends</option>
+                                <option value="baseline">baseline</option>
+                                <option value="same dataset">same dataset</option>
+                                <option value="similar">similar</option>
+                                <option value="other">other</option>
+                            </select>
+                            <input type="text" id="paperLinkNote" placeholder="Short reason (optional)"
+                                style="flex:2; min-width:180px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        </div>
+                        <div style="display:flex; justify-content:flex-end;">
+                            <button class="btn-secondary" onclick="addPaperLink()"><i class="fa-solid fa-link"></i> Link</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notes History Modal -->
+    <div id="notesHistoryModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 75vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-clock-rotate-left"></i> Notes History</h2>
+                <button class="close-btn" onclick="closeNotesHistoryModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; display:flex; flex-direction:column; gap:0.8rem;">
+                <div id="notesHistoryList" style="display:flex; flex-direction:column; gap:0.6rem;"></div>
+                <div id="notesDiffBox" class="hidden" style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.75rem; background:rgba(15,23,42,0.75);">
+                    <div style="font-weight:600; margin-bottom:0.4rem;">Diff</div>
+                    <pre id="notesDiffContent" style="white-space:pre-wrap; font-size:0.85rem; color:#cbd5e1;"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Brief Modal -->
+    <div id="briefModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-mug-hot"></i> Morning Brief</h2>
+                <div style="display:flex; gap:10px">
+                    <button class="action-btn" onclick="playBrief()" title="Listen to Podcast"><i
+                            class="fa-solid fa-headphones"></i> Listen</button>
+                    <button class="close-btn" onclick="closeBriefModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <audio id="briefAudio" style="display:none"></audio>
+                <div id="briefContent" style="line-height: 1.6; font-size: 1.1rem; white-space: pre-wrap;">
+                    Loading your personal research digest...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Smart Alerts Modal -->
+    <div id="alertsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 80vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-bell"></i> Smart Alerts</h2>
+                <div style="display:flex; gap:10px">
+                    <button class="action-btn" onclick="openVersionUpdatesModal()" title="Open version updates">
+                        <i class="fa-solid fa-code-branch"></i> Versions
+                    </button>
+                    <button class="action-btn" onclick="markAllAlertsSeen()" title="Mark all seen">
+                        <i class="fa-solid fa-eye"></i> Mark Seen
+                    </button>
+                    <button class="close-btn" onclick="closeAlertsModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div id="alertsList" style="display:flex; flex-direction:column; gap:0.75rem; padding:0.5rem 0;">
+                    Loading alerts...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mentions Modal -->
+    <div id="mentionsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 70vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-at"></i> Mentions</h2>
+                <div style="display:flex; gap:10px">
+                    <button class="action-btn" onclick="markAllMentionsRead()" title="Mark all read">
+                        <i class="fa-solid fa-check-double"></i> Mark Read
+                    </button>
+                    <button class="close-btn" onclick="closeMentionsModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div style="display:flex; gap:0.6rem; align-items:center; margin-bottom:0.7rem; flex-wrap:wrap;">
+                    <input type="text" id="mentionHandleInput" placeholder="@yourhandle"
+                        style="flex:1; min-width:200px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    <button class="btn-secondary" onclick="saveMentionHandle()">Save</button>
+                    <span id="mentionHandleStatus" style="font-size:0.85rem; color:var(--text-muted);"></span>
+                </div>
+                <div id="mentionsList" style="display:flex; flex-direction:column; gap:0.7rem;">
+                    No mentions yet.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Follow-ups Modal -->
+    <div id="followupsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 70vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-bell"></i> Follow-ups</h2>
+                <div style="display:flex; gap:10px">
+                    <button class="action-btn" onclick="refreshFollowups()" title="Refresh">
+                        <i class="fa-solid fa-rotate"></i> Refresh
+                    </button>
+                    <button class="close-btn" onclick="closeFollowupsModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div id="followupsList" style="display:flex; flex-direction:column; gap:0.75rem; padding:0.5rem 0;">
+                    Loading follow-ups...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change Summary Modal -->
+    <div id="changeSummaryModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 80vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-clock-rotate-left"></i> What changed since last visit</h2>
+                <button class="close-btn" onclick="closeChangeSummaryModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div id="changeSummaryContent" style="display:flex; flex-direction:column; gap:0.9rem; padding:0.5rem 0;">
+                    Loading summary...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Research Trail Modal -->
+    <div id="trailModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 720px; height: 70vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-route"></i> Research Trail</h2>
+                <div style="display:flex; gap:0.5rem;">
+                    <button class="btn-secondary" onclick="resumeLastTrail()" style="padding:0.35rem 0.75rem;">
+                        <i class="fa-solid fa-play"></i> Resume Last
+                    </button>
+                    <button class="action-btn" onclick="clearTrail()" style="border:1px solid rgba(239,68,68,0.35); color:#f87171;">
+                        <i class="fa-solid fa-trash"></i> Clear
+                    </button>
+                    <button class="close-btn" onclick="closeTrailModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; padding:0.8rem 1.1rem;">
+                <div id="trailMeta" style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.6rem;"></div>
+                <div id="trailList" style="display:flex; flex-direction:column; gap:0.6rem;">
+                    No trail yet.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Auto-Digest Inbox Modal -->
+    <div id="digestModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-inbox"></i> Auto-Digest Inbox</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="action-btn" onclick="generateDigest('daily')" title="Generate daily digest">
+                        <i class="fa-solid fa-calendar-day"></i> Daily
+                    </button>
+                    <button class="action-btn" onclick="generateDigest('weekly')" title="Generate weekly digest">
+                        <i class="fa-solid fa-calendar-week"></i> Weekly
+                    </button>
+                    <button class="close-btn" onclick="closeDigestModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%;">
+                <div style="display:flex; flex-wrap:wrap; gap:0.5rem; margin-bottom:0.6rem;">
+                    <button class="btn-secondary" onclick="openWeeklyReviewModal()" style="padding:0.35rem 0.75rem;">
+                        <i class="fa-solid fa-calendar-check"></i> Weekly Review
+                    </button>
+                    <button class="btn-secondary" onclick="setDigestFilter('all')" style="padding:0.35rem 0.75rem;">
+                        All
+                    </button>
+                    <button class="btn-secondary" onclick="setDigestFilter('daily')" style="padding:0.35rem 0.75rem;">
+                        Daily
+                    </button>
+                    <button class="btn-secondary" onclick="setDigestFilter('weekly')" style="padding:0.35rem 0.75rem;">
+                        Weekly
+                    </button>
+                    <button class="btn-secondary" onclick="toggleDigestUnread()" style="padding:0.35rem 0.75rem;">
+                        Unread Only
+                    </button>
+                </div>
+                <div id="digestInboxList" style="display:flex; flex-direction:column; gap:0.75rem; padding:0.5rem 0;">
+                    Loading digests...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Weekly Review Modal -->
+    <div id="weeklyReviewModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 80vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-calendar-check"></i> Weekly Review</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="action-btn" onclick="loadWeeklyReview()" title="Refresh review">
+                        <i class="fa-solid fa-rotate-right"></i> Refresh
+                    </button>
+                    <button class="action-btn" onclick="shareWeeklyReview()" title="Share weekly review">
+                        <i class="fa-solid fa-share-nodes"></i> Share
+                    </button>
+                    <button class="close-btn" onclick="closeWeeklyReviewModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%;">
+                <div id="weeklyReviewContent" style="display:flex; flex-direction:column; gap:0.8rem; padding:0.35rem 0;">
+                    Loading review...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Unified Inbox Modal -->
+    <div id="unifiedInboxModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-layer-group"></i> Unified Inbox</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="action-btn" onclick="refreshUnifiedInbox()" title="Refresh inbox">
+                        <i class="fa-solid fa-rotate-right"></i> Refresh
+                    </button>
+                    <button class="action-btn" onclick="runMyDay()" title="Run day routine">
+                        <i class="fa-solid fa-play"></i> Run My Day
+                    </button>
+                    <button class="close-btn" onclick="closeUnifiedInboxModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%;">
+                <div class="unified-inbox-toolbar">
+                    <div class="unified-inbox-filter-row">
+                        <label style="font-size:0.84rem; color:var(--text-muted);">Scope</label>
+                        <select id="unifiedInboxScope"
+                            style="padding:0.4rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="watchlist">Watchlist</option>
+                            <option value="liked">Favorites</option>
+                            <option value="bookmarked">Bookmarked</option>
+                            <option value="new">New</option>
+                        </select>
+                        <label style="font-size:0.84rem; color:var(--text-muted);">Days</label>
+                        <input id="unifiedInboxDays" type="number" min="1" max="180" value="30"
+                            style="width:90px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <label style="font-size:0.84rem; color:var(--text-muted);">Limit</label>
+                        <input id="unifiedInboxLimit" type="number" min="10" max="200" value="80"
+                            style="width:90px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <label style="font-size:0.84rem; color:var(--text-muted);">Sort</label>
+                        <select id="unifiedInboxSort"
+                            style="padding:0.4rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="recent">Recent</option>
+                            <option value="priority">Priority</option>
+                        </select>
+                        <label style="font-size:0.84rem; color:var(--text-muted);">View</label>
+                        <select id="unifiedInboxViewMode"
+                            style="padding:0.4rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="all">All</option>
+                            <option value="focus">Focus</option>
+                        </select>
+                        <label style="font-size:0.84rem; color:var(--text-muted);">Focus N</label>
+                        <input id="unifiedInboxFocusLimit" type="number" min="1" max="80" value="12"
+                            style="width:80px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <button class="btn-secondary" onclick="refreshUnifiedInbox()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-filter"></i> Apply
+                        </button>
+                    </div>
+                    <div class="unified-inbox-filter-row">
+                        <span style="font-size:0.84rem; color:var(--text-muted);">Kinds</span>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="unifiedInboxKindAlert" type="checkbox" checked onchange="refreshUnifiedInbox()">
+                            Alerts
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="unifiedInboxKindVersion" type="checkbox" checked onchange="refreshUnifiedInbox()">
+                            Versions
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="unifiedInboxKindFollowup" type="checkbox" checked onchange="refreshUnifiedInbox()">
+                            Follow-ups
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="unifiedInboxKindDigest" type="checkbox" checked onchange="refreshUnifiedInbox()">
+                            Digests
+                        </label>
+                        <button class="btn-secondary" onclick="toggleUnifiedInboxKinds(true)" style="padding:0.3rem 0.65rem;">
+                            All
+                        </button>
+                        <button class="btn-secondary" onclick="toggleUnifiedInboxKinds(false)" style="padding:0.3rem 0.65rem;">
+                            None
+                        </button>
+                    </div>
+                    <div class="unified-inbox-filter-row">
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="unifiedInboxSelectAll" type="checkbox" onchange="toggleUnifiedInboxSelectAll(this.checked)">
+                            Select visible
+                        </label>
+                        <span id="unifiedInboxSelectionCount" style="font-size:0.83rem; color:var(--text-muted);">0 selected</span>
+                        <select id="unifiedInboxBulkAction"
+                            style="padding:0.4rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="">Auto by kind</option>
+                            <option value="seen">Mark seen (alerts)</option>
+                            <option value="reviewed">Reviewed (versions)</option>
+                            <option value="dismiss">Dismiss (versions)</option>
+                            <option value="snooze">Snooze (versions/follow-ups)</option>
+                            <option value="done">Done (follow-ups)</option>
+                            <option value="read">Mark read (digests)</option>
+                        </select>
+                        <input id="unifiedInboxBulkSnoozeDays" type="number" min="1" max="90" value="3"
+                            style="width:78px; padding:0.4rem 0.45rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;"
+                            title="Snooze days for snooze actions">
+                        <button class="btn-secondary" onclick="applyUnifiedInboxBulkAction()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-layer-group"></i> Apply Selected
+                        </button>
+                        <button class="btn-secondary" onclick="clearUnifiedInboxSelection()" style="padding:0.35rem 0.75rem;">
+                            Clear
+                        </button>
+                    </div>
+                </div>
+                <div id="unifiedInboxStatus" style="font-size:0.85rem; color:var(--text-muted); margin-bottom:0.6rem;">
+                    Loading inbox...
+                </div>
+                <div id="unifiedInboxList" style="display:flex; flex-direction:column; gap:0.75rem; padding:0.4rem 0;">
+                    <div class="loader"></div>
+                </div>
+                <div class="unified-dayrun-panel">
+                    <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                        <div style="font-weight:700; font-size:0.95rem;">Day Run</div>
+                        <div style="display:flex; gap:0.5rem;">
+                            <button class="btn-secondary" onclick="runMyDay()" style="padding:0.35rem 0.75rem;">
+                                <i class="fa-solid fa-play"></i> Run
+                            </button>
+                            <button class="btn-secondary" onclick="loadDayRunHistory()" style="padding:0.35rem 0.75rem;">
+                                <i class="fa-solid fa-clock-rotate-left"></i> Refresh History
+                            </button>
+                        </div>
+                    </div>
+                    <div class="dayrun-preset-row">
+                        <select id="dayRunPresetSelect" onchange="selectDayRunPreset(this.value)"
+                            style="min-width:180px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="">No preset selected</option>
+                        </select>
+                        <input id="dayRunPresetName" type="text" placeholder="Preset name"
+                            style="min-width:160px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <input id="dayRunPresetDescription" type="text" placeholder="Description (optional)"
+                            style="min-width:220px; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        <button class="btn-secondary" onclick="saveDayRunPreset()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-floppy-disk"></i> Save
+                        </button>
+                        <button class="btn-secondary" onclick="updateDayRunPreset()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-pen-to-square"></i> Update
+                        </button>
+                        <button class="btn-secondary" onclick="deleteDayRunPreset()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-trash"></i> Delete
+                        </button>
+                        <button class="btn-secondary" onclick="runSelectedDayRunPreset()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-play"></i> Run Preset
+                        </button>
+                        <button class="btn-secondary" onclick="loadDayRunPresets()" style="padding:0.35rem 0.75rem;">
+                            <i class="fa-solid fa-rotate-right"></i> Refresh Presets
+                        </button>
+                    </div>
+                    <div class="dayrun-controls">
+                        <div>
+                            <label style="font-size:0.82rem; color:var(--text-muted);">Date</label>
+                            <input id="dayRunDateInput" type="date"
+                                style="width:100%; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                        </div>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="dayRunForceCheck" type="checkbox">
+                            Force
+                        </label>
+                        <div>
+                            <label style="font-size:0.82rem; color:var(--text-muted);">Weekend</label>
+                            <select id="dayRunWeekendPolicy"
+                                style="width:100%; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                                <option value="skip">Skip</option>
+                                <option value="run">Run</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.82rem; color:var(--text-muted);">Rules Scope</label>
+                            <select id="dayRunRulesScope"
+                                style="width:100%; padding:0.42rem 0.5rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                                <option value="all">All</option>
+                                <option value="papers">Papers</option>
+                                <option value="inbox">Inbox</option>
+                            </select>
+                        </div>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="dayRunFetchCheck" type="checkbox" checked>
+                            Fetch
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="dayRunRulesCheck" type="checkbox" checked>
+                            Rules
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="dayRunPlanCheck" type="checkbox" checked>
+                            Reading Plan
+                        </label>
+                        <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.84rem; color:var(--text-muted);">
+                            <input id="dayRunInboxRefreshCheck" type="checkbox" checked>
+                            Inbox Refresh
+                        </label>
+                    </div>
+                    <div id="dayRunStatus" style="font-size:0.82rem; color:var(--text-muted); margin-top:0.45rem;"></div>
+                    <div id="dayRunHistoryList" style="display:flex; flex-direction:column; gap:0.5rem; margin-top:0.55rem;">
+                        <div style="color:var(--text-muted);">No runs yet.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Share Link Modal -->
+    <div id="shareLinkModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 680px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-share-nodes"></i> Share Link</h2>
+                <button class="close-btn" onclick="closeShareLinkModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.75rem;">
+                <div style="color:var(--text-muted); font-size:0.9rem;">
+                    Anyone with this link can view the shared content. You can revoke it anytime.
+                </div>
+                <input id="shareLinkInput" type="text" readonly
+                    style="width:100%; padding:0.6rem 0.75rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0;">
+                <div style="display:flex; gap:0.6rem; justify-content:flex-end;">
+                    <button class="btn-secondary" onclick="copyShareLink()"><i class="fa-solid fa-copy"></i> Copy</button>
+                    <button class="action-btn" onclick="revokeShareLink()" style="border:1px solid rgba(239,68,68,0.4); color:#f87171;">
+                        <i class="fa-solid fa-ban"></i> Revoke
+                    </button>
+                </div>
+                <div id="shareLinkStatus" style="color:var(--text-muted); font-size:0.85rem;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Saved Views Modal -->
+    <div id="savedViewsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 720px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-floppy-disk"></i> Saved Views</h2>
+                <button class="close-btn" onclick="closeSavedViewsModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.9rem;">
+                <div style="display:flex; gap:0.5rem; align-items:center;">
+                    <input id="savedViewNameInput" type="text" placeholder="View name (e.g. Daily LLMs)"
+                        style="flex:1; padding:0.6rem 0.75rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0;">
+                    <button class="btn-secondary" onclick="saveCurrentView()" style="padding:0.45rem 0.9rem;">
+                        <i class="fa-solid fa-floppy-disk"></i> Save
+                    </button>
+                </div>
+                <div id="savedViewsList" style="display:flex; flex-direction:column; gap:0.6rem;">
+                    No saved views yet.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Batch Tag Modal -->
+    <div id="batchTagModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 600px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-tags"></i> Batch Tag Selected Papers</h2>
+                <button class="close-btn" onclick="closeBatchTagModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.75rem;">
+                <div id="batchTagCount" style="color:var(--text-muted); font-size:0.9rem;"></div>
+                <input id="batchTagInput" type="text" placeholder="Add concepts (comma separated). Leave blank for AI auto-tag."
+                    style="width:100%; padding:0.6rem 0.75rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0;">
+                <label style="display:flex; align-items:center; gap:0.5rem; font-size:0.85rem; color:var(--text-muted);">
+                    <input type="checkbox" id="batchTagMergeCheck" checked>
+                    Merge with existing tags
+                </label>
+                <div style="display:flex; gap:0.6rem; justify-content:flex-end;">
+                    <button class="btn-secondary" onclick="runBatchTag()" style="padding:0.45rem 0.9rem;">
+                        <i class="fa-solid fa-tags"></i> Apply Tags
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Saved Search Agents Modal -->
+    <div id="searchAgentsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-satellite-dish"></i> Saved Search Agents</h2>
+                <button class="close-btn" onclick="closeSearchAgentsModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:1rem; overflow-y:auto;">
+                <div
+                    style="display:grid; grid-template-columns: 1.2fr 2fr 0.8fr 0.8fr auto; gap:0.6rem; align-items:end;">
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Name</label>
+                        <input id="agentNameInput" type="text" placeholder="e.g. Diffusion Radar"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">ArXiv Query</label>
+                        <input id="agentQueryInput" type="text" placeholder='e.g. ti:"diffusion" AND cat:cs.CV'
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Cadence</label>
+                        <select id="agentCadenceInput"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Max</label>
+                        <input id="agentMaxResultsInput" type="number" min="1" max="25" value="8"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <button class="btn-primary" onclick="createSearchAgent()" style="height:2.4rem;">
+                        <i class="fa-solid fa-plus"></i> Save
+                    </button>
+                </div>
+                <div id="searchAgentsList" style="display:flex; flex-direction:column; gap:0.7rem;">
+                    Loading agents...
+                </div>
+                <div id="searchAgentRunSummary"
+                    style="white-space:pre-wrap; line-height:1.6; border:1px solid rgba(34,197,94,0.25); border-radius:10px; padding:0.9rem; background:rgba(34,197,94,0.08); display:none;">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scheduler Ops Modal -->
+    <div id="schedulerOpsModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-wave-square"></i> Scheduler Ops</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="action-btn" onclick="loadSchedulerOps()" title="Refresh">
+                        <i class="fa-solid fa-rotate-right"></i> Refresh
+                    </button>
+                    <button class="close-btn" onclick="closeSchedulerOpsModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%;">
+                <div id="schedulerOpsContent"
+                    style="display:flex; flex-direction:column; gap:0.75rem; padding:0.25rem 0;">
+                    <div class="loader"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Concept Graph Modal -->
+    <div id="conceptModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="width: 90vw; height: 90vh; max-width: none;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-project-diagram"></i> Concept Map</h2>
+                <button class="close-btn" onclick="closeConceptModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="padding:0; height:100%; position:relative; background: #0f111a;">
+                <div id="conceptNetwork" style="width: 100%; height: 100%;"></div>
+                <div
+                    style="position:absolute; top:20px; left:20px; background:rgba(0,0,0,0.5); padding:10px; border-radius:8px; pointer-events:none;">
+                    <small style="color:#94a3b8">Double-click a node to filter library.</small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Graph View Container (Hidden initially) -->
+    <div id="graphView" class="hidden"
+        style="height: 80vh; background: var(--card-bg); border-radius: 12px; margin-top: 1rem; position: relative;">
+        <div
+            style="position:absolute; top:10px; left:10px; z-index:10; background:rgba(0,0,0,0.5); padding:5px; border-radius:4px; font-size:0.8rem;">
+            <i class="fa-solid fa-circle-info"></i> Scroll to Zoom • Drag to Pan • Click Node to Focus
+        </div>
+        <!-- We can reuse this container for both graph and galaxy, or create a new one -->
+        <!-- Let's create a new one for Galaxy which uses Chart.js Scatter -->
+        <div id="authorGraph" style="width: 100%; height: 100%;"></div>
+    </div>
+
+    <!-- Galaxy Container -->
+    <div id="galaxyView" class="hidden"
+        style="height: 80vh; background: #000; border-radius: 12px; margin-top: 1rem; position: relative; border: 1px solid #333;">
+        <div
+            style="position:absolute; top:10px; left:10px; z-index:10; background:rgba(0,0,0,0.5); padding:5px; border-radius:4px; font-size:0.8rem; color:var(--text-muted);">
+            <i class="fa-solid fa-atom"></i> <b>Semantic Galaxy</b> (PCA Projection)
+        </div>
+        <button onclick="closeGalaxyView()"
+            style="position:absolute; top:10px; right:10px; z-index:10; background:none; border:none; color:white; font-size:1.5rem; cursor:pointer;">&times;</button>
+        <div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center;">
+            <canvas id="galaxyChart"></canvas>
+        </div>
+    </div>
+    </main>
+    <div id="podcastPlayer" class="podcast-player hidden">
+        <div class="player-content">
+            <div class="track-info">
+                <div class="track-icon">
+                    <i class="fa-solid fa-podcast"></i>
+                </div>
+                <div class="track-details">
+                    <div id="playerTitle" class="track-title">Select a paper to play...</div>
+                    <div id="playerStatus" class="track-status">Queue: 0 items</div>
+                </div>
+            </div>
+            <div class="player-controls">
+                <button class="control-btn small" onclick="playPrevTrack()"><i
+                        class="fa-solid fa-backward-step"></i></button>
+                <button id="playPauseBtn" class="control-btn main" onclick="togglePlay()"><i
+                        class="fa-solid fa-play"></i></button>
+                <button class="control-btn small" onclick="playNextTrack()"><i
+                        class="fa-solid fa-forward-step"></i></button>
+            </div>
+            <div class="player-extra">
+                <div id="playerTime" class="time-display">0:00 / 0:00</div>
+                <button class="control-btn small" onclick="togglePlaylist()" title="View Queue">
+                    <i class="fa-solid fa-list-ol"></i>
+                </button>
+                <button class="control-btn small" onclick="closePlayer()" title="Close Player">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+        </div>
+        <!-- Playlist Drawer -->
+        <div id="playlistDrawer" class="playlist-drawer hidden">
+            <h3>Up Next</h3>
+            <ul id="playlistItems">
+                <!-- Items injected here -->
+            </ul>
+            <div style="text-align:right; padding:0.5rem;">
+                <button class="text-btn" onclick="clearQueue()">Clear Queue</button>
+            </div>
+        </div>
+        <audio id="globalAudio"></audio>
+    </div>
+
+    <!-- Floating Selection Bar -->
+    <div id="selectionBar" class="selection-bar hidden"
+        style="position:fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--card-bg); border: 1px solid var(--primary); padding: 1rem 2rem; border-radius: 50px; display: flex; gap: 1rem; align-items: center; box-shadow: 0 10px 25px rgba(0,0,0,0.5); z-index: 200;">
+        <span id="selectionCount" style="font-weight: 600; color: white;">0 Selected</span>
+        <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.2);"></div>
+        <button class="btn-primary" onclick="startSynthesis()" style="border-radius: 20px; padding: 0.5rem 1.5rem;">
+            <i class="fa-solid fa-wand-magic-sparkles"></i> Synthesize
+        </button>
+        <button id="battleBtn" class="btn-secondary" onclick="startBattle()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444;">
+            <i class="fa-solid fa-gavel"></i> Battle
+        </button>
+        <button id="matrixBtn" class="btn-secondary" onclick="startCompareMatrix()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(14, 165, 233, 0.18); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4);">
+            <i class="fa-solid fa-table-cells-large"></i> Matrix
+        </button>
+        <button id="compareDiffBtn" class="btn-secondary" onclick="startCompareDiff()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(99, 102, 241, 0.18); color: #a5b4fc; border: 1px solid rgba(165, 180, 252, 0.4);">
+            <i class="fa-solid fa-code-compare"></i> Side-by-side
+        </button>
+        <button id="benchmarkBtn" class="btn-secondary" onclick="startBenchmarkExtract()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.4);">
+            <i class="fa-solid fa-table-list"></i> Benchmarks
+        </button>
+        <button id="citationOverlayBtn" class="btn-secondary" onclick="openCitationOverlay()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(59, 130, 246, 0.18); color: #93c5fd; border: 1px solid rgba(147, 197, 253, 0.4);">
+            <i class="fa-solid fa-diagram-project"></i> Citations
+        </button>
+        <button id="batchTagBtn" class="btn-secondary" onclick="openBatchTagModal()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(20, 184, 166, 0.18); color: #5eead4; border: 1px solid rgba(94, 234, 212, 0.4);">
+            <i class="fa-solid fa-tags"></i> Tag
+        </button>
+        <button class="action-btn" onclick="exportBibtex()" title="Export .bib"
+            style="border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3);">
+            <i class="fa-solid fa-file-code"></i> BibTeX
+        </button>
+        <button class="action-btn" onclick="exportBundle()" title="Export bundle (.zip)"
+            style="border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3);">
+            <i class="fa-solid fa-box-archive"></i> Bundle
+        </button>
+        <button class="action-btn" onclick="exportNotion()" title="Export to Notion"
+            style="border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(255, 255, 255, 0.08); color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.2);">
+            <i class="fa-solid fa-file-lines"></i> Notion
+        </button>
+        <span id="bundleCacheBadge" class="scope-badge hidden" data-mode="cached">cached</span>
+        <button class="action-btn" onclick="shareSelection()" title="Share selection"
+            style="border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(148, 163, 184, 0.2); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.35);">
+            <i class="fa-solid fa-share-nodes"></i> Share
+        </button>
+        <button class="text-btn" onclick="clearSelection()" style="color: var(--text-muted);">Cancel</button>
+    </div>
+
+    <button id="backToTopBtn" class="back-to-top hidden" onclick="scrollToTop()">
+        <i class="fa-solid fa-arrow-up"></i> Top
+    </button>
+
+    <!-- Battle Modal -->
+    <div id="battleModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1100px; height: 90vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-gavel"></i> Paper Battle Comparison</h2>
+                <button class="close-btn" onclick="closeBattleModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%; padding: 2rem;">
+                <div id="battleContent" class="markdown-body"
+                    style="line-height: 1.6; font-size: 1.1rem; white-space: pre-wrap;">
+                    <div class="loader"></div> Comparing papers...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Compare Matrix Modal -->
+    <div id="compareMatrixModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1180px; height: 90vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-table-cells-large"></i> Compare Matrix</h2>
+                <button class="close-btn" onclick="closeCompareMatrixModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; padding:1.4rem;">
+                <div id="compareMatrixContent" class="markdown-body" style="line-height:1.6;">
+                    Select papers and run matrix compare.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Compare Diff Modal -->
+    <div id="compareDiffModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1180px; height: 90vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-code-compare"></i> Side-by-side Comparison</h2>
+                <button class="close-btn" onclick="closeCompareDiffModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; padding:1.4rem;">
+                <div id="compareDiffContent" class="markdown-body" style="line-height:1.6;">
+                    Select 2 papers and run side-by-side compare.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Citation Overlay Modal -->
+    <div id="citationOverlayModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1100px; height: 85vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-diagram-project"></i> Citation Overlay</h2>
+                <button class="close-btn" onclick="closeCitationOverlayModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.6rem; height:100%;">
+                <div id="citationOverlayMeta" style="font-size:0.85rem; color:var(--text-muted);"></div>
+                <div id="citationOverlayGraph"
+                    style="flex:1; border:1px solid rgba(255,255,255,0.12); border-radius:10px; background:rgba(15,17,26,0.9);">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Benchmark Extractor Modal -->
+    <div id="benchmarkModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1200px; height: 90vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-table-list"></i> Benchmark Table Extractor</h2>
+                <button class="close-btn" onclick="closeBenchmarkModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; padding:1.2rem;">
+                <div id="benchmarkContent" style="display:flex; flex-direction:column; gap:0.8rem;">
+                    Select papers and run benchmark extraction.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reproducibility Scorecard Modal -->
+    <div id="reproModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 760px; height: 78vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-vial-circle-check"></i> Reproducibility Scorecard</h2>
+                <button class="close-btn" onclick="closeReproModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; padding:1.2rem;">
+                <div id="reproContent" style="display:flex; flex-direction:column; gap:0.8rem;">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Synthesis Modal -->
+    <div id="synthesisModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 900px; height: 90vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-flask"></i> Literature Review</h2>
+                <div style="display:flex; gap:10px">
+                    <button class="action-btn" onclick="exportSynthesis()" title="Save to Obsidian"><i
+                            class="fa-solid fa-file-export"></i> Save</button>
+                    <button class="close-btn" onclick="closeSynthesisModal()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="modal-body" style="overflow-y: auto; height: 100%; padding: 2rem;">
+                <div id="synthesisContent" class="markdown-body"
+                    style="line-height: 1.6; font-size: 1.1rem; white-space: pre-wrap;">
+                    Generating Report...
+                </div>
+            </div>
+        </div>
+    </div>
+    </div>
+
+    <!-- Figure Gallery Modal -->
+    <div id="figureModal" class="modal-overlay hidden">
+        <div class="modal-content figure-modal-content" style="max-width: 1000px; height: 80vh;">
+            <div class="modal-header">
+                <h2>Extracted Figures</h2>
+                <button onclick="closeFigureModal()" class="close-btn"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div id="figureGallery" class="figure-grid"
+                style="padding: 1rem; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem;">
+                <!-- Images go here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Vision Chat Modal (Single Image Focus) -->
+    <div id="visionChatModal" class="modal-overlay hidden">
+        <div class="modal-content vision-modal-content"
+            style="max-width: 1200px; width: 95vw; height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h2>Analyze Figure</h2>
+                <button onclick="closeVisionModal()" class="close-btn"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="vision-layout" style="display: flex; flex: 1; overflow: hidden; gap: 1rem; padding: 1rem;">
+                <div class="vision-image-container"
+                    style="flex: 2; background: #000; border-radius: 8px; display: flex; align-items: center; justify-content: center; overflow: hidden;">
+                    <img id="visionTargetImage" src="" alt="Target Figure"
+                        style="max-width: 100%; max-height: 100%; object-fit: contain;">
+                </div>
+                <div class="vision-chat-container"
+                    style="flex: 1; display: flex; flex-direction: column; background: var(--card-bg); border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);">
+                    <div id="visionChatHistory" class="chat-history"
+                        style="flex-grow: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem;">
+                    </div>
+                    <div class="chat-input-area" style="padding: 1rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <input type="text" id="visionChatInput" placeholder="Ask about this figure..."
+                            style="flex-grow: 1; padding: 0.8rem; border-radius: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white;">
+                        <button onclick="sendVisionMessage()" class="send-btn"><i
+                                class="fa-solid fa-paper-plane"></i></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Research Agent Modal -->
+    <div id="agentModal" class="modal-overlay hidden">
+        <div class="modal-content agent-modal-content"
+            style="max-width: 900px; height: 90vh; background: #000; border: 1px solid #333; color: #00ff00; font-family: monospace;">
+            <div class="modal-header" style="border-bottom: 1px solid #333;">
+                <h2 style="font-family: monospace;"><i class="fa-solid fa-robot"></i> Deep Research Agent v1.0</h2>
+                <button onclick="closeAgentModal()" class="close-btn" style="color: #00ff00;">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; flex-direction: column; height: 100%; padding: 0;">
+
+                <!-- Input State -->
+                <div id="agentInputState" style="padding: 2rem; display: flex; flex-direction: column; gap: 1rem;">
+                    <label>RESEARCH OBJECTIVE:</label>
+                    <textarea id="agentTopic" rows="3" placeholder="e.g. The history of large language models..."
+                        style="background: #111; color: #00ff00; border: 1px solid #333; padding: 1rem; font-family: monospace;"></textarea>
+                    <button onclick="startAgentJob()" class="btn-primary"
+                        style="background: #00ff00; color: black; border: none; font-family: monospace; text-transform: uppercase;">
+                        Initialize Sequence
+                    </button>
+                </div>
+
+                <!-- Running State -->
+                <div id="agentRunningState" class="hidden"
+                    style="flex-grow: 1; display: flex; flex-direction: column; overflow: hidden;">
+                    <div id="agentLogs"
+                        style="flex-grow: 1; overflow-y: auto; padding: 1rem; color: #ccc; white-space: pre-wrap; font-size: 0.9rem;">
+                        <!-- Logs inject here -->
+                    </div>
+                    <div style="padding: 0.5rem; text-align: center; border-top: 1px solid #333;">
+                        <span class="blink">_ PROCESSING</span>
+                    </div>
+                </div>
+
+                <!-- Result State -->
+                <div id="agentResultState" class="hidden"
+                    style="flex-grow: 1; overflow-y: auto; padding: 2rem; background: var(--bg-dark); color: var(--text-main); font-family: 'Outfit', sans-serif;">
+                    <div style="margin-bottom: 2rem; border-bottom: 1px solid #333; padding-bottom: 1rem;">
+                        <button onclick="resetAgentUI()" class="btn-secondary" style="font-size: 0.8rem;">
+                            <i class="fa-solid fa-rotate-left"></i> Start New Research
+                        </button>
+                    </div>
+                    <div id="agentFinalReport" class="markdown-body"></div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Library Chat Modal -->
+    <div id="libChatModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal"
+            style="max-width: 900px; height: 85vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-comments"></i> Chat with Library</h2>
+                <div style="font-size: 0.8rem; color: var(--text-muted); margin-left:1rem;">(RAG Enabled)</div>
+                <button onclick="closeLibraryChatModal()" class="close-btn" style="margin-left: auto;"><i
+                        class="fas fa-times"></i></button>
+            </div>
+
+            <div id="libChatHistory" class="chat-history"
+                style="flex-grow: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem;">
+                <div class="chat-message system">
+                    <div class="message-content">
+                        Hello! I can answer questions using your download library as context. What would you like to
+                        know?
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-area" style="padding: 1rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                <input type="text" id="libChatInput" placeholder="Ask across your library..."
+                    style="flex-grow: 1; padding: 0.8rem; border-radius: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white;"
+                    onkeypress="handleLibChatInput(event)">
+                <button onclick="sendLibChatMessage()" class="send-btn"><i class="fa-solid fa-paper-plane"></i></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discover Modal -->
+    <div id="discoverModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal"
+            style="max-width: 1000px; height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-lightbulb"></i> Discover New Research</h2>
+                <div style="font-size: 0.8rem; color: var(--text-muted); margin-left:1rem;">(Based on your library)
+                </div>
+                <button onclick="closeDiscoverModal()" class="close-btn" style="margin-left: auto;"><i
+                        class="fas fa-times"></i></button>
+            </div>
+
+            <div class="modal-body"
+                style="padding: 0; display: flex; flex-direction: column; overflow: hidden; flex-grow: 1;">
+                <!-- Status/Queries Section -->
+                <div id="discoverStatus"
+                    style="padding: 1rem; border-bottom: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); font-size: 0.9rem; color: var(--text-muted);">
+                    Click 'Start Discovery' to analyze your library and find related work.
+                </div>
+
+                <!-- Results Grid -->
+                <div id="discoverResults" class="grid-container"
+                    style="flex-grow: 1; overflow-y: auto; padding: 2rem; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));">
+                    <!-- Cards injected here -->
+                    <div style="grid-column: 1/-1; text-align: center; margin-top: 3rem;">
+                        <button onclick="runDiscovery()" class="btn-primary"
+                            style="margin: 0 auto; font-size: 1.2rem; padding: 1rem 2rem;">
+                            <i class="fa-solid fa-rocket"></i> Start Discovery
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Method Lineage Modal -->
+    <div id="lineageModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1150px; height: 88vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-sitemap"></i> Method Lineage View</h2>
+                <button class="close-btn" onclick="closeLineageModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body"
+                style="display:flex; flex-direction:column; gap:0.8rem; overflow-y:auto; height:100%;">
+                <div style="display:flex; gap:0.6rem; align-items:center;">
+                    <input id="lineageTopicInput" type="text" placeholder="e.g. diffusion transformers"
+                        style="flex:1; padding:0.6rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.18); color:white; border-radius:6px;">
+                    <button class="btn-primary" onclick="runMethodLineage()">
+                        <i class="fa-solid fa-play"></i> Build Lineage
+                    </button>
+                </div>
+                <div id="lineageStatus" style="font-size:0.88rem; color:var(--text-muted);">
+                    Enter a topic and build ancestor -> improvement -> latest chains.
+                </div>
+                <div style="display:grid; grid-template-columns: 1.1fr 1.4fr; gap:0.8rem; min-height: 0;">
+                    <div id="lineageChains"
+                        style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.8rem; background:rgba(255,255,255,0.03); overflow-y:auto; min-height:420px;">
+                        No lineage yet.
+                    </div>
+                    <div id="lineageGraph"
+                        style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; background:rgba(15,17,26,0.9); min-height:420px;">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Feed Tuner</h2>
+                <button onclick="closeSettings()" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="setting-group">
+                    <label>Obsidian Vault Path (Absolute)</label>
+                    <p class="help-text">e.g. /Users/rchavez/Obsidian/Research</p>
+                    <input type="text" id="settingsVaultPath"
+                        style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                </div>
+                <div class="setting-group">
+                    <label>Categories (comma separated)</label>
+                    <p class="help-text">e.g. astro-ph, cs.LG, quant-ph</p>
+                    <textarea id="settingsCategories" rows="3"></textarea>
+                </div>
+                <div class="setting-group">
+                    <label>Keywords (one per line)</label>
+                    <p class="help-text">Used for highlighting and smart ranking</p>
+                    <textarea id="settingsKeywords" rows="8"></textarea>
+                </div>
+                <div class="setting-group">
+                    <label>Ranking Profile</label>
+                    <p class="help-text">Tune smart sort balance between relevance, novelty, and citations.</p>
+                    <div style="display:grid; gap:0.6rem;">
+                        <div>
+                            <label style="font-size:0.85rem; color:var(--text-muted); display:flex; justify-content:space-between;">
+                                <span>Relevance</span><span id="rankRelevanceValue">50</span>
+                            </label>
+                            <input type="range" id="rankRelevanceSlider" min="0" max="100" value="50">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85rem; color:var(--text-muted); display:flex; justify-content:space-between;">
+                                <span>Novelty</span><span id="rankNoveltyValue">30</span>
+                            </label>
+                            <input type="range" id="rankNoveltySlider" min="0" max="100" value="30">
+                        </div>
+                        <div>
+                            <label style="font-size:0.85rem; color:var(--text-muted); display:flex; justify-content:space-between;">
+                                <span>Citations</span><span id="rankCitationsValue">20</span>
+                            </label>
+                            <input type="range" id="rankCitationsSlider" min="0" max="100" value="20">
+                        </div>
+                        <div style="display:flex; justify-content:flex-end;">
+                            <button class="btn-secondary" onclick="resetRankProfile()">Reset</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Smart Alerts</label>
+                    <p class="help-text">Control alert sensitivity and the number of alerts shown.</p>
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:0.75rem;">
+                        <div>
+                            <label for="settingsAlertCitationThreshold"
+                                style="font-size:0.85rem; color:var(--text-muted);">Citation threshold</label>
+                            <input type="number" id="settingsAlertCitationThreshold" min="0" step="1"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                        </div>
+                        <div>
+                            <label for="settingsAlertMaxResults" style="font-size:0.85rem; color:var(--text-muted);">Max
+                                alerts shown</label>
+                            <input type="number" id="settingsAlertMaxResults" min="10" step="1"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Performance & Reliability</label>
+                    <p class="help-text">Optional warmup to reduce first-response latency.</p>
+                    <label style="display:flex; align-items:center; gap:0.5rem; font-size:0.95rem;">
+                        <input type="checkbox" id="settingsWarmupModels">
+                        Warm up AI + embeddings on startup
+                    </label>
+                </div>
+                <div class="setting-group">
+                    <label>Backup & Restore</label>
+                    <p class="help-text">Download a backup of your local DB + config, or restore from a backup zip.</p>
+                    <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                        <button class="btn-secondary" onclick="downloadBackup()">
+                            <i class="fa-solid fa-box-archive"></i> Download Backup
+                        </button>
+                        <label class="btn-secondary" for="restoreFileInput" style="cursor:pointer;">
+                            <i class="fa-solid fa-rotate-left"></i> Restore Backup
+                        </label>
+                        <input type="file" id="restoreFileInput" accept=".zip" style="display:none;"
+                            onchange="restoreBackupFromFile(event)">
+                    </div>
+                    <div id="backupStatus" style="font-size:0.85rem; color:var(--text-muted); margin-top:0.35rem;">
+                    </div>
+                    <div id="restoreStatus" style="font-size:0.85rem; color:var(--text-muted); margin-top:0.25rem;">
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Notes Export / Import</label>
+                    <p class="help-text">Export notes to JSON for sharing, or import notes from a JSON file.</p>
+                    <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+                        <button class="btn-secondary" onclick="exportNotesJson()">
+                            <i class="fa-solid fa-file-export"></i> Export Notes JSON
+                        </button>
+                        <label class="btn-secondary" for="notesImportInput" style="cursor:pointer;">
+                            <i class="fa-solid fa-file-import"></i> Import Notes JSON
+                        </label>
+                        <input type="file" id="notesImportInput" accept="application/json" style="display:none;"
+                            onchange="importNotesJson(event)">
+                    </div>
+                    <div id="notesImportStatus" style="font-size:0.85rem; color:var(--text-muted); margin-top:0.35rem;"></div>
+                </div>
+                <div class="setting-group">
+                    <label>Export History</label>
+                    <p class="help-text">Bundle exports (re-download available until expiry).</p>
+                    <div style="display:flex; justify-content:flex-end; margin-bottom:0.4rem;">
+                        <button class="btn-secondary" onclick="loadExportHistory()" style="padding:0.35rem 0.7rem;">
+                            <i class="fa-solid fa-rotate"></i> Refresh
+                        </button>
+                    </div>
+                    <div id="exportHistoryList"
+                        style="display:flex; flex-direction:column; gap:0.6rem;">
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Notion Export</label>
+                    <p class="help-text">Provide an integration token and database ID for single-click export.</p>
+                    <input type="password" id="settingsNotionToken" placeholder="Notion integration token"
+                        style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px; margin-bottom:0.5rem;">
+                    <input type="text" id="settingsNotionDbId" placeholder="Notion database ID"
+                        style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                </div>
+                <div class="setting-group">
+                    <label>Weekly Picks</label>
+                    <p class="help-text">Mark papers as Weekly Pick in Notes, then share a public read-only page.</p>
+                    <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                        <button class="btn-secondary" onclick="shareWeeklyPicks()">
+                            <i class="fa-solid fa-share-nodes"></i> Share Weekly Picks
+                        </button>
+                        <button class="btn-secondary" onclick="shareWeeklyPicksDigest()">
+                            <i class="fa-solid fa-scroll"></i> Share Weekly Picks Digest
+                        </button>
+                        <span id="weeklyPicksStatus" style="font-size:0.85rem; color:var(--text-muted);"></span>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Inbox Rules</label>
+                    <p class="help-text">Auto-label, auto-dismiss, or auto-triage inbox items using scoped rules.</p>
+                    <div id="inboxRulesList" style="display:flex; flex-direction:column; gap:0.6rem;"></div>
+                    <div style="margin-top:0.6rem; display:grid; gap:0.6rem;">
+                        <input type="text" id="inboxRuleName" placeholder="Rule name (e.g. Dismiss surveys)"
+                            style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                        <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:0.6rem;">
+                            <select id="inboxRuleScope"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                                <option value="papers">Scope: Papers</option>
+                                <option value="inbox">Scope: Inbox</option>
+                                <option value="all">Scope: All</option>
+                            </select>
+                            <select id="inboxRuleAction"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                                <option value="label">Label</option>
+                                <option value="dismiss">Dismiss</option>
+                                <option value="seen">Mark seen (alerts)</option>
+                                <option value="reviewed">Reviewed (versions)</option>
+                                <option value="snooze">Snooze (versions/follow-ups)</option>
+                                <option value="done">Done (follow-ups)</option>
+                                <option value="read">Mark read (digests)</option>
+                            </select>
+                            <select id="inboxRuleTargetKind"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                                <option value="">Target: Any</option>
+                                <option value="alert">Alerts</option>
+                                <option value="version_update">Version updates</option>
+                                <option value="follow_up">Follow-ups</option>
+                                <option value="digest">Digests</option>
+                            </select>
+                        </div>
+                        <div style="display:grid; grid-template-columns: 1fr 140px; gap:0.6rem;">
+                            <input type="text" id="inboxRuleLabel" placeholder="Label (used for label action)"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                            <input type="number" id="inboxRuleSnoozeDays" min="1" max="90" value="3" placeholder="Snooze days"
+                                style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                        </div>
+                        <textarea id="inboxRuleKeywords" rows="2" placeholder="Keywords (comma or line separated)"
+                            style="width:100%;"></textarea>
+                        <textarea id="inboxRuleAuthors" rows="2" placeholder="Authors (comma or line separated)"
+                            style="width:100%;"></textarea>
+                        <textarea id="inboxRuleVenues" rows="2" placeholder="Categories / venues (comma or line separated)"
+                            style="width:100%;"></textarea>
+                        <div style="display:flex; justify-content:space-between; gap:0.6rem; flex-wrap:wrap;">
+                            <label style="display:flex; align-items:center; gap:0.4rem; font-size:0.9rem; color:var(--text-muted);">
+                                <input type="checkbox" id="inboxRuleEnabled" checked>
+                                Enabled
+                            </label>
+                            <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                                <select id="inboxRulesApplyScope"
+                                    style="padding:0.4rem 0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                                    <option value="all">Apply Scope: All</option>
+                                    <option value="papers">Apply Scope: Papers</option>
+                                    <option value="inbox">Apply Scope: Inbox</option>
+                                </select>
+                                <button class="btn-secondary" onclick="previewInboxRulesNow()" style="padding:0.35rem 0.8rem;">
+                                    <i class="fa-solid fa-flask"></i> Preview
+                                </button>
+                                <button class="btn-secondary" onclick="applyInboxRulesNow()" style="padding:0.35rem 0.8rem;">
+                                    <i class="fa-solid fa-bolt"></i> Apply Now
+                                </button>
+                                <button class="btn-primary" onclick="saveInboxRule()" style="padding:0.35rem 0.8rem;">
+                                    <i class="fa-solid fa-plus"></i> Add Rule
+                                </button>
+                            </div>
+                        </div>
+                        <div id="inboxRulesStatus" style="font-size:0.85rem; color:var(--text-muted);"></div>
+                        <div style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.6rem; background:rgba(255,255,255,0.02);">
+                            <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
+                                <div style="font-size:0.86rem; color:var(--text-muted); font-weight:600;">Preview</div>
+                                <button class="btn-secondary" onclick="previewInboxRulesNow()" style="padding:0.3rem 0.7rem;">
+                                    <i class="fa-solid fa-rotate-right"></i> Refresh
+                                </button>
+                            </div>
+                            <div id="inboxRulesPreviewList" style="display:flex; flex-direction:column; gap:0.45rem;"></div>
+                        </div>
+                        <div style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.6rem; background:rgba(255,255,255,0.02);">
+                            <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem; flex-wrap:wrap;">
+                                <div style="font-size:0.86rem; color:var(--text-muted); font-weight:600;">Audit Log</div>
+                                <div style="display:flex; gap:0.45rem; align-items:center;">
+                                    <input id="inboxRulesAuditLimit" type="number" min="10" max="500" value="80"
+                                        style="width:85px; padding:0.35rem 0.45rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                                    <button class="btn-secondary" onclick="loadInboxRuleAudit()" style="padding:0.3rem 0.7rem;">
+                                        <i class="fa-solid fa-rotate-right"></i> Refresh
+                                    </button>
+                                </div>
+                            </div>
+                            <div id="inboxRulesAuditList" style="display:flex; flex-direction:column; gap:0.45rem;"></div>
+                        </div>
+                        <div style="border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.6rem; background:rgba(255,255,255,0.02);">
+                            <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem; flex-wrap:wrap;">
+                                <div style="font-size:0.86rem; color:var(--text-muted); font-weight:600;">Diagnostics</div>
+                                <button class="btn-secondary" onclick="loadInboxRuleDiagnostics()" style="padding:0.3rem 0.7rem;">
+                                    <i class="fa-solid fa-stethoscope"></i> Refresh
+                                </button>
+                            </div>
+                            <div id="inboxRulesDiagnosticsList" style="display:flex; flex-direction:column; gap:0.45rem;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="saveSettings()" class="btn-primary">Save Changes</button>
+            </div>
+        </div>
+    </div>
+    <!-- Create Folder Modal -->
+    <div id="createFolderModal" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>New Smart Collection</h3>
+                <button class="close-modal" onclick="closeCreateFolderModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="text" id="folderNameInput" placeholder="Collection Name (e.g. LLMs)" class="search-input"
+                    style="width:100%; margin-bottom:1rem;">
+                <input type="text" id="folderQueryInput" placeholder="Search Query (e.g. Large Language Model)"
+                    class="search-input" style="width:100%; margin-bottom:1rem;">
+                <p style="font-size:0.8rem; color:var(--text-muted);">Papers matching this search will automatically
+                    appear in this collection.</p>
+                <button class="btn-primary" onclick="createSmartFolder()"
+                    style="width:100%; justify-content:center;">Create Collection</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Collection Digest Schedule Modal -->
+    <div id="folderScheduleModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 640px;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-calendar-days"></i> Collection Digest Schedule</h2>
+                <button class="close-btn" onclick="closeFolderScheduleModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.75rem;">
+                <div id="folderScheduleTitle" style="font-weight:600;">Collection</div>
+                <div id="folderScheduleMeta" style="color:var(--text-muted); font-size:0.85rem;"></div>
+                <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:0.6rem;">
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Cadence</label>
+                        <select id="folderScheduleCadence"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Max items</label>
+                        <input id="folderScheduleMaxItems" type="number" min="3" max="30" value="10"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.4rem;">
+                        <input type="checkbox" id="folderScheduleEnabled" checked>
+                        <label for="folderScheduleEnabled" style="font-size:0.82rem; color:var(--text-muted);">Enabled</label>
+                    </div>
+                </div>
+                <div style="display:flex; gap:0.6rem; justify-content:flex-end;">
+                    <button class="btn-secondary" onclick="runFolderDigestNow()" style="padding:0.45rem 0.9rem;">
+                        <i class="fa-solid fa-play"></i> Run now
+                    </button>
+                    <button class="btn-secondary" onclick="saveFolderSchedule()" style="padding:0.45rem 0.9rem;">
+                        <i class="fa-solid fa-floppy-disk"></i> Save
+                    </button>
+                    <button class="action-btn" onclick="disableFolderSchedule()"
+                        style="border:1px solid rgba(239,68,68,0.4); color:#f87171; padding:0.45rem 0.9rem;">
+                        <i class="fa-solid fa-ban"></i> Disable
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Survey Agent Modal -->
+    <div id="surveyModal" class="modal-overlay hidden">
+        <div class="modal-content agent-modal-content"
+            style="max-width: 900px; height: 90vh; background: #0f111a; border: 1px solid #333; color: #ec4899; font-family: monospace;">
+            <div class="modal-header" style="border-bottom: 1px solid #333;">
+                <h2 style="font-family: monospace;"><i class="fa-solid fa-scroll"></i> Auto-Survey Agent v1.0</h2>
+                <button onclick="closeSurveyModal()" class="close-btn" style="color: #ec4899;">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; flex-direction: column; height: 100%; padding: 0;">
+
+                <!-- Input State -->
+                <div id="surveyInputState" style="padding: 2rem; display: flex; flex-direction: column; gap: 1rem;">
+                    <label>SURVEY TOPIC:</label>
+                    <textarea id="surveyTopic" rows="3" placeholder="e.g. Recent advances in State Space Models..."
+                        style="background: #1e212b; color: #ec4899; border: 1px solid #333; padding: 1rem; font-family: monospace;"></textarea>
+                    <button onclick="startSurveyJob()" class="btn-primary"
+                        style="background: #ec4899; color: black; border: none; font-family: monospace; text-transform: uppercase;">
+                        Initialize Survey Loop
+                    </button>
+                </div>
+
+                <!-- Running State -->
+                <div id="surveyRunningState" class="hidden"
+                    style="flex-grow: 1; display: flex; flex-direction: column; overflow: hidden;">
+                    <div id="surveyLogs"
+                        style="flex-grow: 1; overflow-y: auto; padding: 1rem; color: #ccc; white-space: pre-wrap; font-size: 0.9rem;">
+                        <!-- Logs inject here -->
+                    </div>
+                    <div style="padding: 0.5rem; text-align: center; border-top: 1px solid #333;">
+                        <span class="blink">_ GENERATING</span>
+                    </div>
+                </div>
+
+                <!-- Result State -->
+                <div id="surveyResultState" class="hidden"
+                    style="flex-grow: 1; overflow-y: auto; padding: 2rem; background: var(--bg-dark); color: var(--text-main); font-family: 'Outfit', sans-serif;">
+                    <div
+                        style="margin-bottom: 2rem; border-bottom: 1px solid #333; padding-bottom: 1rem; display:flex; gap:10px;">
+                        <button onclick="resetSurveyUI()" class="btn-secondary" style="font-size: 0.8rem;">
+                            <i class="fa-solid fa-rotate-left"></i> New Survey
+                        </button>
+                        <button onclick="copySurveyOutput()" class="btn-secondary" style="font-size: 0.8rem;">
+                            <i class="fa-solid fa-copy"></i> Copy Markdown
+                        </button>
+                    </div>
+                    <div id="surveyFinalReport" class="markdown-body"></div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <datalist id="recentSearchesList"></datalist>
+    <script src="app.js?v=131"></script>
+</body>
+
+</html>

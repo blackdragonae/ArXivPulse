@@ -1,0 +1,32 @@
+{
+  "categories": [
+    "astro-ph",
+    "astro-ph.CO",
+    "astro-ph.EP",
+    "astro-ph.GA",
+    "astro-ph.HE",
+    "astro-ph.IM",
+    "astro-ph.SR",
+    "gr-qc",
+    "hep-th",
+    "quant-ph",
+    "math.GT"
+  ],
+  "keywords": [
+    "HII galaxies",
+    "HII regions",
+    "Cosmology",
+    "Dark Energy",
+    "Cosmological constant",
+    "Hubble constant tension",
+    "Hubble constant",
+    "Hubble tension",
+    "Star formation",
+    "Massive stars",
+    "Cepheids"
+  ],
+  "vault_path": "/Users/rchavez/Documents/Obsidian Vault",
+  "warmup_models": false,
+  "notion_token": "",
+  "notion_database_id": ""
+}

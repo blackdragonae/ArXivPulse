@@ -1,0 +1,1151 @@
+import os
+from collections import Counter
+import re
+from typing import List, Dict, Any, Optional
+from functools import lru_cache
+from datetime import datetime
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+@lru_cache(maxsize=12)
+def _extract_text_cached(abs_pdf_path: str, mtime: float) -> str:
+    reader = PdfReader(abs_pdf_path)
+    text_parts = []
+    for page in reader.pages:
+        content = page.extract_text()
+        if content:
+            text_parts.append(content)
+    return "\n".join(text_parts)
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extracts raw text from a PDF file."""
+    if not os.path.exists(pdf_path):
+        return ""
+    
+    if not PdfReader:
+        return "Error: pypdf not installed."
+
+    try:
+        abs_path = os.path.abspath(pdf_path)
+        mtime = os.path.getmtime(abs_path)
+        return _extract_text_cached(abs_path, mtime)
+    except Exception as e:
+        print(f"Error reading PDF {pdf_path}: {e}")
+        return ""
+
+@lru_cache(maxsize=128)
+def _count_pages_cached(abs_pdf_path: str, mtime: float) -> int:
+    reader = PdfReader(abs_pdf_path)
+    return len(reader.pages)
+
+def count_pdf_pages(pdf_path: str) -> int:
+    """Counts pages in a PDF file."""
+    if not os.path.exists(pdf_path):
+        return 0
+    if not PdfReader:
+        return 0
+    try:
+        abs_path = os.path.abspath(pdf_path)
+        mtime = os.path.getmtime(abs_path)
+        return int(_count_pages_cached(abs_path, mtime))
+    except Exception as e:
+        print(f"Error counting PDF pages {pdf_path}: {e}")
+        return 0
+
+def estimate_reading_time_minutes(page_count: int, minutes_per_page: float = 2.0) -> int:
+    try:
+        pages = max(0, int(page_count))
+    except Exception:
+        pages = 0
+    if pages <= 0:
+        return 0
+    try:
+        minutes = int(round(pages * float(minutes_per_page)))
+    except Exception:
+        minutes = pages * 2
+    return max(1, minutes)
+        
+import requests
+import json
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "mistral:latest"
+
+def query_ollama(prompt: str, context: str, images: List[str] = None, timeout: int = 300) -> str:
+    """Queries the local Ollama instance."""
+    full_prompt = f"""You are a helpful academic assistant. Answer the question based ONLY on the provided context (an academic paper).
+    
+    Context:
+    {context[:15000]} # Limit context window to ~15k chars for speed/safety
+    ... [truncated]
+    
+    Question: {prompt}
+    
+    Answer:"""
+    
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": "Hello" if not context and not prompt else (prompt if not context else full_prompt), 
+        "stream": False
+    }
+    
+    if images:
+        # If images are present, we might want to switch model to llava if not already?
+        # Or assume user has set MODEL_NAME to a vision model?
+        # For now, let's allow the caller to override or just pass images.
+        # Ideally we use a vision model like 'llava'.
+        # Let's check if MODEL_NAME is vision capable? 
+        # For this specific feature, we will likely force a vision model if images are present.
+        payload["images"] = images
+        # If using mistral, it might error with images.
+        # We'll assume the user has switched model or we force it here?
+        # Let's try to trust the config or auto-switch?
+        # For safety, if images > 0, we should probably try 'llava' or 'moondream'.
+        # But 'mistral' doesn't support images. 
+        # Let's stick to the plan: User must have llava.
+        # We will override model if images are present.
+        payload["model"] = "llava" 
+        payload["options"] = {"num_predict": 1024} # Increase generation limit for images/reports?
+
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+        
+        if response.status_code == 200:
+            return response.json().get('response', '')
+        else:
+            print(f"Ollama Error: {response.text}")
+            return None
+    except requests.exceptions.ReadTimeout:
+        print("Ollama Timeout: Generation took too long.")
+        return None
+    except requests.exceptions.ConnectionError:
+        return None # Ollama not running
+    except Exception as e:
+        print(f"Ollama Exception: {e}")
+        return None
+
+def describe_image(image_base64: str, prompt: str = "Describe this image in detail.") -> str:
+    """Generates a description for an image using a Vision model."""
+    return query_ollama(prompt, "", images=[image_base64])
+
+
+def simple_chat_logic(text: str, query: str) -> str:
+    """
+    Dispatcher: Tries Ollama first, falls back to heuristic.
+    """
+    if not text:
+        return "I couldn't read the text of this paper. Please ensure the PDF is downloaded."
+
+    # 1. Try AI
+    ai_response = query_ollama(query, text)
+    if ai_response:
+        return f"{ai_response}\n\n*(Generated by {MODEL_NAME})*"
+        
+    # 2. Fallback to Heuristic
+    query_words = [w.lower() for w in query.split() if len(w) > 3]
+    if not query_words:
+        return "Please ask a more specific question."
+        
+    sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
+    scored_sentences = []
+    
+    for sentence in sentences:
+        score = sum(1 for word in query_words if word in sentence.lower())
+        if score > 0:
+            scored_sentences.append((score, sentence))
+            
+    scored_sentences.sort(key=lambda x: x[0], reverse=True)
+    
+    if not scored_sentences:
+        return "I couldn't find any specific mention of that in the paper."
+        
+    # Return top 3 sentences
+    top_picks = [s[1].strip() for s in scored_sentences[:3]]
+    response = "Based on the text, here is what I found (Heuristic Search):\n\n"
+    for pick in top_picks:
+        response += f"- \"...{pick}...\"\n"
+        
+    return response
+
+def extract_paper_structure(paper: Dict[str, str]) -> Dict[str, str]:
+    """
+    Heuristic structured extraction from title/abstract.
+    Returns fields for problem/method/dataset/results/limitations.
+    """
+    title = (paper.get("title") or "").strip()
+    abstract = (paper.get("summary") or "").strip()
+    text = f"{title}. {abstract}".strip()
+    if not text:
+        return {
+            "problem": "",
+            "method": "",
+            "dataset": "",
+            "results": "",
+            "limitations": "",
+        }
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    if not sentences:
+        sentences = [text]
+
+    def pick(keywords: List[str], default: str = "") -> str:
+        for s in sentences:
+            low = s.lower()
+            if any(k in low for k in keywords):
+                return s
+        return default
+
+    problem = sentences[0]
+    method = pick(
+        ["we propose", "we present", "method", "approach", "framework", "algorithm", "model"],
+        default=sentences[min(1, len(sentences) - 1)],
+    )
+    dataset = pick(
+        ["dataset", "benchmark", "data from", "evaluation on", "experiment on", "experiments on"],
+        default="Not explicitly specified in abstract.",
+    )
+    results = pick(
+        ["result", "improv", "achiev", "outperform", "state-of-the-art", "sota", "significant"],
+        default="Key quantitative results not clearly stated in abstract.",
+    )
+    limitations = pick(
+        ["limitation", "future work", "challenge", "however", "although", "constraint"],
+        default="Limitations not explicitly stated in abstract.",
+    )
+
+    return {
+        "problem": problem,
+        "method": method,
+        "dataset": dataset,
+        "results": results,
+        "limitations": limitations,
+    }
+
+def generate_reading_questions(paper: Dict[str, Any], max_questions: int = 5) -> List[str]:
+    """Generates 3-5 guiding questions for a paper."""
+    title = (paper.get("title") or "").strip()
+    summary = (paper.get("summary") or "").strip()
+    context = f"Title: {title}\nAbstract: {summary}".strip()
+    prompt = f"""Generate 3-5 concise, specific questions a reader should answer while reading this paper.
+Return ONLY the questions as a numbered list.
+
+Context:
+{context}
+"""
+    response = query_ollama(prompt, "", timeout=90)
+    questions: List[str] = []
+    if response:
+        for line in response.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r'^\d+[\).\s-]+', '', cleaned).strip()
+            cleaned = cleaned.lstrip("-•* ").strip()
+            if cleaned:
+                questions.append(cleaned)
+    if not questions:
+        topic = title or "this paper"
+        questions = [
+            f"What problem does {topic} address, and why is it important?",
+            "What is the core method or model proposed, and how does it differ from prior work?",
+            "What datasets or benchmarks are used for evaluation?",
+            "What are the key quantitative results and takeaways?",
+            "What limitations or open questions remain?",
+        ]
+    deduped = []
+    seen = set()
+    for q in questions:
+        if q.lower() in seen:
+            continue
+        deduped.append(q)
+        seen.add(q.lower())
+        if len(deduped) >= max(3, min(max_questions, 5)):
+            break
+    return deduped
+
+def generate_brief(papers: List[Dict[str, Any]], user_interests: List[str] = None) -> str:
+    """
+    Generates a newsletter-style brief for a list of papers using Ollama.
+    Prioritizes papers matching user_interests.
+    """
+    if not papers:
+        return "No papers to summarize."
+        
+    # SCORE PAPERS
+    # If we have interests, sort by overlap
+    # If not, we just take the first few (which usually are newest)
+    
+    selected_papers = papers
+    interest_context = "general AI and Physics"
+    
+    if user_interests:
+        interest_context = ", ".join(user_interests)
+        scored = []
+        for p in papers:
+            text = (p.get('title', '') + " " + p.get('summary', '')).lower()
+            score = 0
+            for kw in user_interests:
+                if kw.lower() in text:
+                    score += 1
+            scored.append((score, p))
+            
+        # Sort desc by score, then by date (assuming they came in sorted by date)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Take top 5, but ensure we don't just take 0-score ones if we have better ones
+        # Actually any 5 is fine, but ranked is better.
+        selected_papers = [s[1] for s in scored[:5]]
+        
+    else:
+        selected_papers = papers[:5]
+
+    # Construct context from titles and abstracts
+    context = ""
+    for i, p in enumerate(selected_papers, 1):
+        context += f"Paper {i}: {p['title']}\nAbstract: {p['summary'][:1000]}...\n\n"
+        
+    prompt = f"""You are an expert research analyst writing a PERSONALIZED 'Morning Brief' newsletter for a user.
+    The user is specifically interested in: {interest_context}.
+    
+    Review the following {len(selected_papers)} papers. Select the most relevant ones (or all) and write a digest.
+    
+    Requirements:
+    - Format as a Markdown list.
+    - Title: "☕ Your Personalized Morning Brief"
+    - Intro: One sentence addressing the user's interests (e.g. "Good morning! Here are the latest developments in Transformers and Cosmology...").
+    - For each paper:
+        - **Title** (Bold)
+        - RELEVANCE: One sentence explaining WHY this matches their interests (if it does).
+        - SUMMARY: One crisp paragraph explaining the core innovation.
+    - Be professional, enthusiastic, and concise.
+    
+    Papers:
+    {context}
+    
+    Morning Brief:"""
+    
+    # Try AI
+    ai_response = query_ollama(prompt, "") # Context is embedded in prompt
+    
+    if ai_response:
+        return f"{ai_response}\n\n*(Personalized for you by {MODEL_NAME})*"
+        
+    # Fallback if AI fails (Offline mode)
+    fallback = f"# ☕ Your Morning Brief (Offline Mode)\n*Filtering for: {interest_context}*\n\n"
+    for p in selected_papers:
+        text = (p.get('title', '') + " " + p.get('summary', '')).lower()
+        matches = [kw for kw in (user_interests or []) if kw.lower() in text]
+        match_str = f"matches: {', '.join(matches)}" if matches else "New Arrival"
+        
+        fallback += f"### {p['title']}\n*({match_str})*\n{p['summary'][:200]}...\n\n"
+    return fallback
+
+def _clean_json_block(text: str) -> str:
+    payload = (text or "").strip()
+    if payload.startswith("```json"):
+        payload = payload[7:].strip()
+    elif payload.startswith("```"):
+        payload = payload[3:].strip()
+    if payload.endswith("```"):
+        payload = payload[:-3].strip()
+    return payload
+
+def _try_parse_json(text: str) -> Optional[Any]:
+    payload = _clean_json_block(text)
+    if not payload:
+        return None
+    try:
+        return json.loads(payload)
+    except Exception:
+        pass
+
+    start = payload.find("{")
+    end = payload.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = payload[start:end + 1]
+        try:
+            return json.loads(snippet)
+        except Exception:
+            return None
+    return None
+
+def generate_interest_digest(
+    papers: List[Dict[str, Any]],
+    user_keywords: Optional[List[str]] = None,
+    followed_authors: Optional[List[str]] = None,
+    cadence: str = "daily",
+    max_items: int = 10,
+) -> Dict[str, Any]:
+    """
+    Generates a ranked digest payload with per-paper "why this matters" reasons.
+    """
+    if not papers:
+        return {
+            "cadence": cadence,
+            "title": f"{cadence.title()} Digest - {datetime.now().date().isoformat()}",
+            "summary": "No matching papers found for this digest window.",
+            "items": [],
+        }
+
+    keywords = [k.strip().lower() for k in (user_keywords or []) if k and k.strip()]
+    followed = {a.strip().lower() for a in (followed_authors or []) if a and a.strip()}
+    max_items = max(1, min(int(max_items), 15))
+
+    def _parse_date(raw: str) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                return datetime.strptime(raw[:10], "%Y-%m-%d")
+            except Exception:
+                return None
+
+    now = datetime.now()
+    ranked = []
+    for p in papers:
+        title = str(p.get("title") or "")
+        summary = str(p.get("summary") or "")
+        text = f"{title} {summary}".lower()
+        authors = p.get("authors") or []
+        if isinstance(authors, str):
+            authors = [authors]
+        authors_lc = [str(a).lower() for a in authors]
+
+        kw_hits = [kw for kw in keywords if kw in text]
+        author_hits = [a for a in authors if str(a).lower() in followed]
+        citation_count = int(p.get("citation_count") or 0)
+        code_hint = bool(re.search(r'https?://(www\.)?(github\.com|gitlab\.com|huggingface\.co)/', summary, re.IGNORECASE))
+
+        published_dt = _parse_date(str(p.get("published") or ""))
+        recency_days = 30.0
+        if published_dt:
+            now_ref = datetime.now(published_dt.tzinfo) if published_dt.tzinfo is not None else now
+            recency_days = max(0.0, (now_ref - published_dt).total_seconds() / 86400.0)
+
+        recency_bonus = 0.0
+        if cadence == "daily":
+            recency_bonus = max(0.0, 3.0 - (recency_days / 2.0))
+        else:
+            recency_bonus = max(0.0, 2.5 - (recency_days / 4.0))
+
+        score = (
+            (2.0 * len(kw_hits)) +
+            (3.0 * len(author_hits)) +
+            min(3.0, citation_count / 20.0) +
+            (1.0 if code_hint else 0.0) +
+            recency_bonus
+        )
+
+        reasons = []
+        if kw_hits:
+            reasons.append(f"Keyword match: {', '.join(kw_hits[:3])}.")
+        if author_hits:
+            reasons.append(f"Includes followed author: {', '.join(author_hits[:2])}.")
+        if citation_count >= 25:
+            reasons.append(f"Strong traction ({citation_count} citations).")
+        if code_hint:
+            reasons.append("Contains open-code/repository signal.")
+        if not reasons:
+            reasons.append("Strong topical overlap with your reading interests.")
+
+        contributors = {
+            "keywords": kw_hits[:5],
+            "authors": author_hits[:3],
+            "citations": citation_count if citation_count else 0,
+            "code": bool(code_hint),
+            "recency_days": round(recency_days, 1) if recency_days is not None else None,
+        }
+
+        ranked.append(
+            {
+                "paper_id": str(p.get("id") or ""),
+                "title": title,
+                "score": round(score, 3),
+                "reason": " ".join(reasons),
+                "contributors": contributors,
+            }
+        )
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    items = ranked[:max_items]
+
+    title = f"{cadence.title()} Digest - {datetime.now().date().isoformat()}"
+    bullet_block = "\n".join([f"- {i['title']} | why: {i['reason']}" for i in items[:6]])
+    prompt = f"""You are writing a concise research inbox digest.
+
+Cadence: {cadence}
+Top picks:
+{bullet_block}
+
+Write a 2-4 sentence summary:
+- mention the dominant themes
+- mention why these papers are likely useful now
+- keep it direct and actionable
+"""
+    ai_summary = query_ollama(prompt, "", timeout=60)
+    summary = ai_summary.strip() if ai_summary else (
+        f"Top {len(items)} picks emphasize high-signal relevance, recency, and alignment with tracked interests."
+    )
+
+    return {
+        "cadence": cadence,
+        "title": title,
+        "summary": summary,
+        "items": items,
+    }
+
+def _extract_metric_hits(text: str) -> Dict[str, str]:
+    low = (text or "").lower()
+    patterns = {
+        "Accuracy": r'(?:accuracy|acc)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?\s*%?)',
+        "F1": r'(?:f1(?:-score)?)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?\s*%?)',
+        "AUC": r'(?:auc)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?\s*%?)',
+        "BLEU": r'(?:bleu)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+        "ROUGE": r'(?:rouge(?:-[12l])?)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+        "WER": r'(?:wer)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?\s*%?)',
+        "MSE": r'(?:mse)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+        "MAE": r'(?:mae)\s*(?:of|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+    }
+    out: Dict[str, str] = {}
+    for metric, pattern in patterns.items():
+        m = re.search(pattern, low, re.IGNORECASE)
+        if m:
+            out[metric] = m.group(1).strip()
+    return out
+
+def extract_benchmark_table(papers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Extracts a compare table of dataset/metric signals for selected papers.
+    """
+    if not papers:
+        return {"columns": [], "rows": [], "notes": ["No papers selected."]}
+
+    papers = papers[:8]
+    columns = [{"id": str(p.get("id") or ""), "title": str(p.get("title") or "")} for p in papers]
+
+    context_lines = []
+    for idx, p in enumerate(papers, 1):
+        context_lines.append(
+            f"Paper {idx}\n"
+            f"id: {p.get('id','')}\n"
+            f"title: {p.get('title','')}\n"
+            f"abstract: {p.get('summary','')}\n"
+        )
+
+    prompt = f"""Extract benchmark evidence from these papers and return ONLY JSON.
+
+Required schema:
+{{
+  "rows": [
+    {{
+      "dataset": "dataset name",
+      "metric": "metric name",
+      "values": {{
+        "1": "value for paper 1 or n/a",
+        "2": "value for paper 2 or n/a"
+      }}
+    }}
+  ],
+  "notes": ["short note", "short note"]
+}}
+
+Rules:
+- include only rows supported by the abstracts
+- use "n/a" if missing
+- keep rows concise and deduplicated
+
+PAPERS:
+{chr(10).join(context_lines)}
+"""
+    response = query_ollama(prompt, "", timeout=120)
+    parsed = _try_parse_json(response or "")
+    if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+        normalized_rows = []
+        for row in parsed.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            dataset = str(row.get("dataset") or "Unknown dataset")
+            metric = str(row.get("metric") or "Metric")
+            values_raw = row.get("values") or {}
+            values: Dict[str, str] = {}
+            if isinstance(values_raw, dict):
+                for idx, p in enumerate(papers, 1):
+                    pid = str(p.get("id") or "")
+                    values[pid] = str(values_raw.get(str(idx)) or values_raw.get(pid) or "n/a")
+            normalized_rows.append({"dataset": dataset, "metric": metric, "values": values})
+
+        notes = parsed.get("notes") if isinstance(parsed.get("notes"), list) else []
+        notes = [str(n) for n in notes[:5]]
+        if normalized_rows:
+            return {"columns": columns, "rows": normalized_rows, "notes": notes}
+
+    # Deterministic fallback
+    dataset_hints = [
+        "imagenet", "cifar-10", "cifar100", "mnist", "coco", "squad", "wmt", "librispeech",
+        "common voice", "mmlu", "hellaswag", "arc", "gsm8k", "sst-2", "glue", "superglue",
+        "cityscapes", "kitti", "waymo", "nuScenes".lower(), "ade20k", "ucl", "kinetics",
+    ]
+    table: Dict[tuple[str, str], Dict[str, str]] = {}
+    notes = []
+
+    for p in papers:
+        pid = str(p.get("id") or "")
+        summary = str(p.get("summary") or "")
+        low = summary.lower()
+        metric_hits = _extract_metric_hits(summary)
+
+        found_datasets = [d for d in dataset_hints if d in low]
+        if not found_datasets:
+            found_datasets = ["unspecified benchmark"]
+
+        if not metric_hits:
+            key = (found_datasets[0].title(), "Reported result")
+            table.setdefault(key, {})
+            table[key][pid] = "qualitative / not explicit"
+            continue
+
+        for dataset in found_datasets[:2]:
+            for metric, value in metric_hits.items():
+                key = (dataset.title(), metric)
+                table.setdefault(key, {})
+                table[key][pid] = value
+
+    rows = []
+    for (dataset, metric), values in table.items():
+        row_values = {}
+        for p in papers:
+            pid = str(p.get("id") or "")
+            row_values[pid] = str(values.get(pid) or "n/a")
+        rows.append({"dataset": dataset, "metric": metric, "values": row_values})
+
+    rows.sort(key=lambda r: (r["dataset"], r["metric"]))
+    if not rows:
+        notes.append("No explicit benchmark/metric mentions found in selected abstracts.")
+    else:
+        notes.append("Table is inferred from abstract-level signals and may omit appendix-only metrics.")
+
+    return {"columns": columns, "rows": rows[:40], "notes": notes}
+
+def generate_literature_review(papers: List[Dict[str, Any]]) -> str:
+    """
+    Generates a comparative literature review for a list of papers.
+    """
+    if not papers:
+        return "No papers selected for review."
+
+    context = ""
+    for i, p in enumerate(papers, 1):
+        context += f"Paper {i}: {p.get('title', 'Unknown')}\n"
+        context += f"Authors: {', '.join(p.get('authors', []))}\n"
+        context += f"Abstract: {p.get('summary', '')}\n\n"
+
+    prompt = f"""You are a senior academic researcher conducting a literature review on the following {len(papers)} papers:
+
+{context}
+
+Please write a structured synthesis report comparing these works.
+Structure your response as follows (use Markdown):
+
+# Literature Review Synthesis
+
+## 1. Executive Summary
+Briefly summarize the common themes and collective significance of these papers.
+
+## 2. Comparative Analysis
+- **Methodologies**: Compare the approaches taken. How do they differ?
+- **Data & Experiments**: What datasets or experimental setups were used?
+
+## 3. Key Contributions & Insights
+Highlight the specific novelties contributed by each work.
+
+## 4. Contradictions or Divergences
+Do the papers agree? Are there conflicting results or theoretical differences?
+
+## 5. Research Gaps & Future Directions
+Based on these works, what is missing? What should be done next?
+
+Write in a professional, academic tone. Cite papers by their number (e.g., [Paper 1]) or Title.
+"""
+
+    response = query_ollama(prompt, "")
+    if response:
+        return response
+
+    return "Error: Failed to generate literature review (AI service unavailable)."
+
+def decide_relevance(topic: str, paper_summary: str) -> bool:
+    """
+    Agent Decision: Is this paper relevant to the topic?
+    Returns True/False.
+    """
+    prompt = f"""You are a research agent.
+    Topic: "{topic}"
+    
+    Paper Abstract:
+    {paper_summary[:2000]}
+    
+    Task: Determine if this paper is HIGHLY relevant to the topic and worth reading in depth for a research report.
+    Reply with ONLY 'YES' or 'NO'."""
+    
+    res = query_ollama(prompt, "")
+    if res and "YES" in res.upper():
+        return True
+    return False
+
+def synthesize_research_report(topic: str, findings: List[str]) -> str:
+    """
+    Synthesizes a final Deep Research report from a list of paper summaries/notes.
+    """
+    context = "\n\n".join(findings)
+    
+    prompt = f"""You are an advanced AI Research Agent. You have finished investigating the topic: "{topic}".
+    
+    Here are your raw notes and findings from analyzing multiple papers:
+    
+    {context[:25000]} # Truncate to fit context
+    
+    Task: Write a comprehensive "Deep Dive" Research Report.
+    Structure:
+    # Deep Dive: {topic}
+    ## 1. Executive Summary
+    ## 2. Key Timeline / Genealogy
+    ## 3. Core Methodologies Found
+    ## 4. Critical Discoveries
+    ## 5. Conclusion
+    
+    Be detailed, academic, and cite specific papers mentioned in the notes.
+    """
+    
+    return query_ollama(prompt, "", timeout=600) or "Failed to generate report."
+
+from . import storage, embeddings
+
+def chat_with_library(query: str, limit: int = 5) -> str:
+    """
+    RAG: Embeds query, finds relevant papers, and answers based on them.
+    """
+    # 1. Embed Query
+    query_vec = embeddings.generate_embedding(query)
+    if query_vec.size == 0:
+        return "Error: Could not process query."
+        
+    # 2. Retrieve Documents
+    results = storage.search_semantic(query_vec, limit=limit)
+    if not results:
+        return "I couldn't find any relevant papers in your library to answer that."
+        
+    # 3. Fetch Metadata for Context
+    paper_ids = [r['id'] for r in results]
+    papers = storage.get_papers_by_ids(paper_ids)
+    
+    context = ""
+    for i, p in enumerate(papers, 1):
+        context += f"Paper {i}: {p['title']}\n"
+        context += f"Abstract: {p['summary']}\n\n"
+        
+    # 4. Generate Answer
+    prompt = f"""You are a helpful research assistant with access to the user's library.
+    
+    User Query: "{query}"
+    
+    Here are the most relevant papers I found in the library:
+    {context}
+    
+    Based ONLY on these papers, answer the user's question. 
+    Cite the papers by title or number (e.g. [1]) when using their information.
+    If the answer is not in these papers, say so.
+    """
+    
+    return query_ollama(prompt, "", timeout=60) or "Sorry, I couldn't generate an answer."
+
+def generate_discovery_queries(liked_papers: list[dict]) -> list[str]:
+    """
+    Analyzes liked papers to generate ArXiv search queries for discovery.
+    """
+    if not liked_papers:
+        return ["cat:cs.AI", "cat:cs.LG", "cat:cs.CV"]
+        
+    # Summarize interests
+    titles = [p['title'] for p in liked_papers[:10]] # Limit to recent 10 to avoid drift
+    context = "\n".join(titles)
+    
+    prompt = f"""You are a research recommender system. 
+    The user likes these papers:
+    {context}
+    
+    Generate 5 distinct, specific ArXiv search queries to find NEW, related papers.
+    Format them strictly as ArXiv API queries (e.g. `ti:"generative adversarial" AND cat:cs.CV`).
+    Do not use generic queries like 'machine learning'. Be specific to the sub-topics implied by the titles.
+    
+    Return ONLY the 5 queries, one per line. No other text.
+    """
+    
+    response = query_ollama(prompt, "", timeout=45)
+    if not response:
+        return ["cat:cs.AI"]
+        
+    queries = [line.strip() for line in response.split('\n') if line.strip() and not line.startswith("//")]
+    return queries[:5]
+
+def compare_papers(papers: list[dict]) -> str:
+    """
+    Generates a comparative analysis "Battle" between two papers.
+    """
+    if len(papers) != 2:
+        return "Error: Battle Mode requires exactly 2 papers."
+        
+    p1 = papers[0]
+    p2 = papers[1]
+    
+    prompt = f"""You are a referee in a "Paper Battle" (Academic Comparative Analysis).
+    
+    Paper A: "{p1['title']}"
+    Abstract A: {p1['summary']}
+    
+    Paper B: "{p2['title']}"
+    Abstract B: {p2['summary']}
+    
+    Task: Produce a Markdown Comparison Table comparing them directly.
+    
+    Format:
+    # ⚔️ Battle: {p1['title'][:20]}... vs {p2['title'][:20]}...
+    
+    | Feature | Paper A | Paper B |
+    | :--- | :--- | :--- |
+    | **Core Idea** | ... | ... |
+    | **Methodology** | ... | ... |
+    | **Dataset/Exp** | ... | ... |
+    | **Novelty** | ... | ... |
+    | **Weaknesses** | ... | ... |
+    
+    ## Winner?
+    Briefly discuss which paper is stronger in which context.
+    """
+    
+    return query_ollama(prompt, "", timeout=180) or "Error: Referee timeout. The models are thinking too hard!"
+
+def compare_papers_matrix(papers: List[Dict[str, Any]]) -> str:
+    """
+    Generates a comparison matrix for 2-6 papers.
+    """
+    if len(papers) < 2:
+        return "Please select at least 2 papers."
+
+    papers = papers[:6]
+    paper_block = []
+    for i, p in enumerate(papers, 1):
+        paper_block.append(
+            f"Paper {i}\n"
+            f"Title: {p.get('title', '')}\n"
+            f"Published: {(p.get('published') or '')[:10]}\n"
+            f"Abstract: {p.get('summary', '')}\n"
+        )
+
+    prompt = f"""You are an expert research analyst.
+
+Create a concise markdown comparison matrix for the following papers.
+Use one table with the first column as "Criterion" and one column per paper.
+Keep each cell short and practical.
+
+Required criteria rows:
+- Problem
+- Core method
+- Data / benchmark evidence
+- Main strength
+- Main risk / limitation
+- Reproducibility outlook
+
+Then add a short section:
+## Recommendation
+2-4 bullets describing which paper to read first depending on goals.
+
+PAPERS:
+{chr(10).join(paper_block)}
+"""
+    response = query_ollama(prompt, "", timeout=210)
+    if response:
+        return response
+
+    # Deterministic fallback
+    header = "| Criterion | " + " | ".join([f"P{i+1}" for i in range(len(papers))]) + " |"
+    sep = "| :--- | " + " | ".join([":---" for _ in papers]) + " |"
+    rows = []
+
+    def has_code(text: str) -> bool:
+        return bool(re.search(r'https?://(www\.)?(github\.com|gitlab\.com|huggingface\.co)/', text))
+
+    for criterion in ["Problem", "Core method", "Data / benchmark evidence", "Main strength", "Main risk / limitation", "Reproducibility outlook"]:
+        vals = []
+        for p in papers:
+            title = p.get("title", "")
+            summary = p.get("summary", "")
+            low = f"{title} {summary}".lower()
+            if criterion == "Problem":
+                vals.append((summary.split(".")[0] or title)[:80])
+            elif criterion == "Core method":
+                vals.append("Model/approach proposed" if any(k in low for k in ["propose", "method", "framework", "model"]) else "Not explicit")
+            elif criterion == "Data / benchmark evidence":
+                vals.append("Benchmarks mentioned" if any(k in low for k in ["dataset", "benchmark", "evaluation", "experiment"]) else "Limited evidence")
+            elif criterion == "Main strength":
+                vals.append("Strong empirical signal" if any(k in low for k in ["outperform", "state-of-the-art", "improv", "significant"]) else "Conceptual contribution")
+            elif criterion == "Main risk / limitation":
+                vals.append("Potential external validity risk" if not any(k in low for k in ["limitation", "however", "future work"]) else "Authors note constraints")
+            else:
+                vals.append("Better (code-linked)" if has_code(low) else "Needs more artifacts")
+        rows.append("| " + criterion + " | " + " | ".join(vals) + " |")
+
+    rec = "\n".join([f"- P{i+1}: \"{(p.get('title') or '')[:70]}\"" for i, p in enumerate(papers[:3])])
+    return "\n".join(["# Compare Matrix", "", header, sep, *rows, "", "## Recommendation", rec])
+
+def generate_reproducibility_scorecard(paper: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns a lightweight reproducibility scorecard from title/abstract metadata.
+    """
+    title = paper.get("title") or ""
+    summary = paper.get("summary") or ""
+    text = f"{title}\n{summary}"
+    low = text.lower()
+
+    code_match = re.search(r'https?://(www\.)?(github\.com|gitlab\.com|huggingface\.co)/[^\s\)\]]+', text, re.IGNORECASE)
+    code_link = code_match.group(0) if code_match else None
+
+    checks = []
+
+    if code_link:
+        checks.append({"name": "Code availability", "score": 2, "max": 2, "reason": f"Repository link detected ({code_link})."})
+    elif any(k in low for k in ["code available", "implementation", "source code"]):
+        checks.append({"name": "Code availability", "score": 1, "max": 2, "reason": "Code is referenced but no direct repository link was detected."})
+    else:
+        checks.append({"name": "Code availability", "score": 0, "max": 2, "reason": "No code artifact signal found in title/abstract."})
+
+    if any(k in low for k in ["dataset", "benchmark"]) and any(k in low for k in ["released", "public", "available", "open"]):
+        checks.append({"name": "Data accessibility", "score": 2, "max": 2, "reason": "Dataset/benchmark and availability cues are present."})
+    elif any(k in low for k in ["dataset", "benchmark", "corpus"]):
+        checks.append({"name": "Data accessibility", "score": 1, "max": 2, "reason": "Data source is mentioned but accessibility is unclear."})
+    else:
+        checks.append({"name": "Data accessibility", "score": 0, "max": 2, "reason": "No clear dataset signal in abstract."})
+
+    eval_has_metrics = any(k in low for k in ["accuracy", "f1", "auc", "bleu", "rouge", "mse", "mae", "outperform", "state-of-the-art"])
+    eval_has_protocol = any(k in low for k in ["experiment", "evaluation", "benchmark", "ablation"])
+    if eval_has_metrics and eval_has_protocol:
+        checks.append({"name": "Evaluation clarity", "score": 2, "max": 2, "reason": "Both protocol and metric/performance signals are present."})
+    elif eval_has_protocol:
+        checks.append({"name": "Evaluation clarity", "score": 1, "max": 2, "reason": "Evaluation protocol is referenced, but metrics are sparse."})
+    else:
+        checks.append({"name": "Evaluation clarity", "score": 0, "max": 2, "reason": "Little explicit evaluation detail found."})
+
+    detail_strong = any(k in low for k in ["hyperparameter", "training details", "seed", "implementation detail"])
+    detail_weak = any(k in low for k in ["we describe", "details", "appendix", "supplementary"])
+    if detail_strong:
+        checks.append({"name": "Reproduction detail", "score": 2, "max": 2, "reason": "Strong training/configuration detail cues detected."})
+    elif detail_weak:
+        checks.append({"name": "Reproduction detail", "score": 1, "max": 2, "reason": "Some detail cues are present, but not explicit enough."})
+    else:
+        checks.append({"name": "Reproduction detail", "score": 0, "max": 2, "reason": "No strong implementation-detail signal detected."})
+
+    openness = 0
+    if any(k in low for k in ["open-source", "public", "released"]):
+        openness += 1
+    if "license" in low:
+        openness += 1
+    checks.append({
+        "name": "Open-science signals",
+        "score": min(2, openness),
+        "max": 2,
+        "reason": "Open/public/license signals detected." if openness else "No explicit open-science/license signal found."
+    })
+
+    total = sum(c["score"] for c in checks)
+    max_total = sum(c["max"] for c in checks)
+    if total >= 8:
+        level = "High"
+    elif total >= 5:
+        level = "Moderate"
+    else:
+        level = "Low"
+
+    return {
+        "paper_id": paper.get("id"),
+        "title": title,
+        "overall_score": total,
+        "max_score": max_total,
+        "level": level,
+        "code_link": code_link,
+        "checks": checks,
+        "summary": f"{level} reproducibility outlook based on abstract-level signals.",
+    }
+
+def summarize_saved_search_results(agent_name: str, query: str, papers: List[Dict[str, Any]]) -> str:
+    """
+    Builds a brief digest for a saved-search run.
+    """
+    if not papers:
+        return f"No new high-signal matches for '{agent_name}' ({query}) in this run."
+
+    top = papers[:5]
+    bullets = "\n".join([f"- {p.get('title', 'Untitled')} ({(p.get('published') or '')[:10]})" for p in top])
+    prompt = f"""You are writing a short research alert digest.
+Agent: {agent_name}
+Query: {query}
+Top papers:
+{bullets}
+
+Return markdown with:
+1) one-line headline
+2) 3-5 bullets on notable themes/findings
+3) one suggested next action.
+Keep it concise.
+"""
+    response = query_ollama(prompt, "", timeout=90)
+    if response:
+        return response
+
+    return (
+        f"### {agent_name} digest\n"
+        f"Found {len(papers)} matching papers for `{query}`.\n"
+        f"{bullets}\n"
+        f"- Suggested next action: review the top 2 papers for methods/data fit."
+    )
+
+def generate_podcast_script(paper: dict) -> list[dict]:
+    """
+    Generates a conversational podcast script (Host vs Expert).
+    Returns list of {'role': 'Host'|'Expert', 'text': '...'}.
+    """
+    prompt = f"""You are a scriptwriter for a tech podcast.
+    Paper: "{paper.get('title')}"
+    Summary: "{paper.get('summary')}"
+    
+    Task: Write a short, engaging dialogue (approx 3-4 minutes read time) between:
+    - HOST: Enthusiastic, curious, asks simple questions.
+    - EXPERT: Knowledgeable, calm, explains complex ideas simply.
+    
+    Format output ONLY as JSON List:
+    [
+        {{"role": "Host", "text": "Welcome back! Today we're looking at..."}},
+        {{"role": "Expert", "text": "That's right..."}}
+    ]
+    
+    Keep it punchy. Start immediately. No markdown outside JSON.
+    """
+    
+    response = query_ollama(prompt, "", timeout=120)
+    if not response:
+        return []
+        
+    try:
+        # cleanup
+        json_str = response.strip()
+        if json_str.startswith('```json'):
+            json_str = json_str[7:-3]
+        elif json_str.startswith('```'):
+            json_str = json_str[3:-3]
+            
+        import json
+        return json.loads(json_str)
+    except Exception as e:
+        print(f"Error parsing script: {e}")
+        # Fallback to simple text
+        return []
+
+def extract_concepts(paper: dict) -> list[str]:
+    """
+    Extracts 3-5 specific technical concepts/methods from the paper using Ollama.
+    e.g. ['LoRA', 'Attention', 'Reinforcement Learning']
+    """
+    prompt = f"""Target: Extract exact technical methods, unique algorithms, or specific frameworks from this paper.
+    Paper: "{paper.get('title')}"
+    Summary: "{paper.get('summary')}"
+    
+    Rules:
+    1. Output ONLY a raw JSON list of strings.
+    2. Max 5 concepts.
+    3. Be specific (e.g. prefer "PPO" over "RL", "LoRA" over "Fine-tuning").
+    4. No explanations.
+    
+    Example Output: ["LoRA", "Transformer", "Quantization"]
+    """
+    
+    response = query_ollama(prompt, "")
+    if not response: 
+        return []
+        
+    try:
+         # clean markdown
+        json_str = response.strip()
+        if json_str.startswith('```json'):
+            json_str = json_str[7:-3]
+        elif json_str.startswith('```'):
+            json_str = json_str[3:-3]
+            
+        import json
+        tags = json.loads(json_str)
+        if isinstance(tags, list):
+            return [t for t in tags if isinstance(t, str)]
+        return []
+    except Exception as e:
+        print(f"Error extracting concepts: {e}")
+        return []
+
+def cluster_papers(papers: List[Dict[str, Any]]) -> str:
+    """
+    Groups papers into thematic clusters.
+    Returns JSON string: { "Theme Name": ["paper_id_1", "paper_id_2"], ... }
+    """
+    if not papers:
+        return "{}"
+        
+    context = ""
+    for p in papers:
+        context += f"ID: {p['id']}\nTitle: {p['title']}\nAbstract: {p['summary'][:500]}...\n\n"
+        
+    prompt = f"""You are a senior editor organizing a survey paper.
+    
+    Task: Group these {len(papers)} papers into 3-5 distinct, high-level thematic clusters.
+    Each paper must belong to exactly one cluster.
+    
+    Papers:
+    {context}
+    
+    Return ONLY valid JSON mapping Theme Name to list of Paper IDs.
+    Example:
+    {{
+      "Transformer Architectures": ["2103.1234", "2201.5678"],
+      "Efficient Training": ["2305.9999"]
+    }}
+    """
+    
+    return query_ollama(prompt, "", timeout=120) or "{}"
+
+def write_survey_section(theme: str, papers: List[Dict[str, Any]]) -> str:
+    """
+    Writes a detailed survey section for a specific theme.
+    """
+    if not papers:
+        return ""
+        
+    context = ""
+    for p in papers:
+        context += f"Ref [{p['id']}]: {p['title']}\nAbstract: {p['summary']}\n\n"
+        
+    prompt = f"""You are writing a section for a technical survey paper on the theme: "{theme}".
+    
+    Review these specific papers:
+    {context}
+    
+    Task: Write a comprehensive, academic-style synthesis of these works.
+    - Focus on their contributions to "{theme}".
+    - Compare and contrast their approaches.
+    - Cite them using their Ref IDs like [Paper ID].
+    - Do NOT list them one by one. synthesize a narrative.
+    
+    Output Format: Markdown.
+    Start directly with the content.
+    """
+    
+    return query_ollama(prompt, "", timeout=300) or f"Failed to generate section for {theme}."

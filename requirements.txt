@@ -1,0 +1,9 @@
+arxiv
+rich
+typer
+fastapi
+python-multipart
+uvicorn
+pypdf
+scikit-learn
+requests

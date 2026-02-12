@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# Local data / sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# Runtime artifacts
+logs/
+output/
+tmp/
+downloads/
+reports/
+server.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Audio/media exports
+test.m4a
