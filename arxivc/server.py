@@ -4445,6 +4445,22 @@ def _run_daily_fetch(date_str: Optional[str] = None, force: bool = False) -> Dic
         )
         result["skipped"] = False
         return result
+    except client.ArxivRateLimitError as e:
+        retry_after = max(1, int(getattr(e, "retry_after_seconds", 60) or 60))
+        storage.record_daily_fetch_run(
+            date_str,
+            status="error",
+            reason=str(e),
+            forced=bool(force),
+        )
+        _end_fetch_pipeline()
+        return {
+            "skipped": False,
+            "error": str(e),
+            "status_code": 429,
+            "retry_after_seconds": retry_after,
+            "date": date_str,
+        }
     except Exception as e:
         storage.record_daily_fetch_run(
             date_str,
@@ -4691,7 +4707,13 @@ def api_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
     storage.init_db()
     start_ts = time.perf_counter()
     if not _start_fetch_pipeline():
-        raise HTTPException(status_code=409, detail="Fetch already running.")
+        started_at = None
+        with _FETCH_PIPELINE_LOCK:
+            started_at = _FETCH_PIPELINE_STARTED_AT
+        detail = "Fetch already running."
+        if started_at:
+            detail = f"Fetch already running (started at {started_at})."
+        raise HTTPException(status_code=409, detail=detail)
     try:
         if req.date:
             papers = client.fetch_papers_by_date(req.date)
@@ -4717,6 +4739,22 @@ def api_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
             date=batch_date,
         )
         return result
+    except client.ArxivRateLimitError as e:
+        _end_fetch_pipeline()
+        retry_after = max(1, int(getattr(e, "retry_after_seconds", 60) or 60))
+        _log_request_timing(
+            "request.fetch",
+            start_ts,
+            status="error",
+            error=str(e),
+            http_status=429,
+            retry_after=retry_after,
+        )
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={"detail": str(e), "retry_after_seconds": retry_after},
+        )
     except Exception as e:
         _end_fetch_pipeline()
         _log_request_timing("request.fetch", start_ts, status="error", error=str(e))
@@ -4750,6 +4788,8 @@ def run_daily_fetch(date: Optional[str] = None, force: bool = False):
 
     result = _run_daily_fetch(date_str=date, force=force)
     if "error" in result:
+        status_code = int(result.get("status_code") or 500)
+        retry_after = int(result.get("retry_after_seconds") or 0)
         _log_request_timing(
             "request.fetch_daily",
             start_ts,
@@ -4757,8 +4797,16 @@ def run_daily_fetch(date: Optional[str] = None, force: bool = False):
             error=str(result.get("error")),
             date=result.get("date"),
             forced=bool(force),
+            http_status=status_code,
+            retry_after=retry_after or None,
         )
-        raise HTTPException(status_code=500, detail=result["error"])
+        if status_code == 429 and retry_after > 0:
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={"detail": result["error"], "retry_after_seconds": retry_after},
+            )
+        raise HTTPException(status_code=status_code, detail=result["error"])
     _log_request_timing(
         "request.fetch_daily",
         start_ts,
