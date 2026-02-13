@@ -493,7 +493,16 @@ async function fetchJsonWithCache(url, options = {}) {
         const retry = await fetch(url, { ...options, headers, cache: 'no-store' });
         const retryData = await retry.json();
         if (!retry.ok) {
-            throw new Error(retryData.detail || `HTTP ${retry.status}`);
+            const err = new Error(retryData.detail || `HTTP ${retry.status}`);
+            err.status = retry.status;
+            const retryAfterRaw = retry.headers.get('Retry-After');
+            const retryAfter = Number.parseInt(retryAfterRaw || '', 10);
+            if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSeconds = retryAfter;
+            if (retryData && Number.isFinite(Number(retryData.retry_after_seconds))) {
+                err.retryAfterSeconds = Number(retryData.retry_after_seconds);
+            }
+            err.payload = retryData;
+            throw err;
         }
         cacheApiResponse(url, retryData);
         return { data: retryData, cached: false, status: retry.status };
@@ -505,7 +514,16 @@ async function fetchJsonWithCache(url, options = {}) {
         data = null;
     }
     if (!res.ok) {
-        throw new Error((data && data.detail) ? data.detail : `HTTP ${res.status}`);
+        const err = new Error((data && data.detail) ? data.detail : `HTTP ${res.status}`);
+        err.status = res.status;
+        const retryAfterRaw = res.headers.get('Retry-After');
+        const retryAfter = Number.parseInt(retryAfterRaw || '', 10);
+        if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSeconds = retryAfter;
+        if (data && Number.isFinite(Number(data.retry_after_seconds))) {
+            err.retryAfterSeconds = Number(data.retry_after_seconds);
+        }
+        err.payload = data;
+        throw err;
     }
     cacheApiResponse(url, data);
     return { data, cached: false, status: res.status };
@@ -533,9 +551,23 @@ async function apiFetchJson(url, { method = 'GET', body = null, useCache = true,
             throw err;
         }
     }
-    const data = await res.json();
+    let data = null;
+    try {
+        data = await res.json();
+    } catch (e) {
+        data = null;
+    }
     if (!res.ok) {
-        throw new Error(data.detail || `HTTP ${res.status}`);
+        const err = new Error((data && data.detail) ? data.detail : `HTTP ${res.status}`);
+        err.status = res.status;
+        const retryAfterRaw = res.headers.get('Retry-After');
+        const retryAfter = Number.parseInt(retryAfterRaw || '', 10);
+        if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSeconds = retryAfter;
+        if (data && Number.isFinite(Number(data.retry_after_seconds))) {
+            err.retryAfterSeconds = Number(data.retry_after_seconds);
+        }
+        err.payload = data;
+        throw err;
     }
     return data;
 }
@@ -2371,6 +2403,17 @@ async function fetchNewPapers() {
         refreshAllBadges();
     } catch (err) {
         console.error("Fetch Error:", err);
+        const status = Number(err && err.status ? err.status : 0);
+        const retryAfter = Number(err && err.retryAfterSeconds ? err.retryAfterSeconds : 0);
+        if (status === 429) {
+            const waitLabel = retryAfter > 0 ? `${Math.ceil(retryAfter)}s` : 'a short wait';
+            alert(`arXiv rate limit reached. Please retry in ${waitLabel}.`);
+            return;
+        }
+        if (status === 409) {
+            alert((err && err.message) ? err.message : "Fetch already in progress. Please wait a moment and retry.");
+            return;
+        }
         alert("Error fetching papers: " + (err.message || str(err)) + "\nCheck logs.");
     } finally {
         fetchBtn.disabled = false;

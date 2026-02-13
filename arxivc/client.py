@@ -12,7 +12,9 @@ from . import config
 ARXIV_PAGE_SIZE = max(20, min(int(os.environ.get("ARXIVC_ARXIV_PAGE_SIZE", "200") or 200), 2000))
 ARXIV_DELAY_SECONDS = max(0.0, float(os.environ.get("ARXIVC_ARXIV_DELAY_SECONDS", "3.0") or 3.0))
 ARXIV_NUM_RETRIES = max(0, int(os.environ.get("ARXIVC_ARXIV_NUM_RETRIES", "1") or 1))
-ARXIV_REQUEST_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("ARXIVC_ARXIV_TIMEOUT_SECONDS", "12.0") or 12.0))
+ARXIV_REQUEST_TIMEOUT_SECONDS = max(
+    2.0, float(os.environ.get("ARXIVC_ARXIV_TIMEOUT_SECONDS", "20.0") or 20.0)
+)
 ARXIV_RATE_LIMIT_COOLDOWN_SECONDS = max(
     5, int(os.environ.get("ARXIVC_ARXIV_429_COOLDOWN_SECONDS", "90") or 90)
 )
@@ -42,7 +44,31 @@ class _TimeoutSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 
-_ARXIV_CLIENT = arxiv.Client(
+class _ResilientArxivClient(arxiv.Client):
+    """
+    Extend arxiv.Client retry logic to include request timeouts.
+    This keeps retries at the page level instead of restarting the whole fetch.
+    """
+
+    def _parse_feed(
+        self, url: str, first_page: bool = True, _try_index: int = 0
+    ):
+        try:
+            return self._Client__try_parse_feed(url, first_page=first_page, try_index=_try_index)
+        except (
+            arxiv.HTTPError,
+            arxiv.UnexpectedEmptyPageError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as err:
+            if _try_index < self.num_retries:
+                arxiv.logger.debug("Got error (try %d): %s", _try_index, err)
+                return self._parse_feed(url, first_page=first_page, _try_index=_try_index + 1)
+            arxiv.logger.debug("Giving up (try %d): %s", _try_index, err)
+            raise err
+
+
+_ARXIV_CLIENT = _ResilientArxivClient(
     page_size=ARXIV_PAGE_SIZE,
     delay_seconds=ARXIV_DELAY_SECONDS,
     num_retries=ARXIV_NUM_RETRIES,
@@ -106,7 +132,9 @@ def _with_arxiv_client(op: Callable[[arxiv.Client], T]) -> T:
             raise RuntimeError(f"arXiv API request failed with HTTP {status}.") from err
         except requests.exceptions.Timeout as err:
             raise RuntimeError(
-                f"arXiv request timed out after {int(ARXIV_REQUEST_TIMEOUT_SECONDS)}s."
+                "arXiv request timed out after "
+                f"{int(ARXIV_REQUEST_TIMEOUT_SECONDS)}s "
+                f"(retries={int(ARXIV_NUM_RETRIES)})."
             ) from err
         except requests.exceptions.RequestException as err:
             raise RuntimeError(f"arXiv request failed: {err}") from err
