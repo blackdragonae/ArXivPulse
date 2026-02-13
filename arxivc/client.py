@@ -9,11 +9,11 @@ import requests
 from . import config
 
 
-ARXIV_PAGE_SIZE = max(20, min(int(os.environ.get("ARXIVC_ARXIV_PAGE_SIZE", "200") or 200), 2000))
+ARXIV_PAGE_SIZE = max(20, min(int(os.environ.get("ARXIVC_ARXIV_PAGE_SIZE", "100") or 100), 2000))
 ARXIV_DELAY_SECONDS = max(0.0, float(os.environ.get("ARXIVC_ARXIV_DELAY_SECONDS", "3.0") or 3.0))
-ARXIV_NUM_RETRIES = max(0, int(os.environ.get("ARXIVC_ARXIV_NUM_RETRIES", "1") or 1))
+ARXIV_NUM_RETRIES = max(0, int(os.environ.get("ARXIVC_ARXIV_NUM_RETRIES", "2") or 2))
 ARXIV_REQUEST_TIMEOUT_SECONDS = max(
-    2.0, float(os.environ.get("ARXIVC_ARXIV_TIMEOUT_SECONDS", "20.0") or 20.0)
+    2.0, float(os.environ.get("ARXIVC_ARXIV_TIMEOUT_SECONDS", "30.0") or 30.0)
 )
 ARXIV_RATE_LIMIT_COOLDOWN_SECONDS = max(
     5, int(os.environ.get("ARXIVC_ARXIV_429_COOLDOWN_SECONDS", "90") or 90)
