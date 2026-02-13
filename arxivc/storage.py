@@ -1,5 +1,6 @@
 import sqlite3
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import numpy as np
@@ -16,7 +17,32 @@ NOTES_HISTORY_LIMIT = 20
 _DB_INITIALIZED_PATH: Optional[str] = None
 _DB_INITIALIZED_SIGNATURE: Optional[tuple[int, int]] = None
 
-def _connect():
+_CONNECTION_SCOPE = threading.local()
+
+
+class _ScopedConnectionProxy:
+    """
+    Proxy that prevents storage helpers from closing a shared scoped connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_conn":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._conn, name, value)
+
+    def close(self) -> None:
+        # Keep scoped connection alive until the scope exits.
+        return None
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def _new_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -26,6 +52,35 @@ def _connect():
     except Exception:
         pass
     return conn
+
+
+@contextmanager
+def connection_scope():
+    """
+    Reuses one SQLite connection for nested storage reads in a request-like scope.
+    """
+    existing = getattr(_CONNECTION_SCOPE, "conn", None)
+    if existing is not None:
+        yield existing
+        return
+
+    conn = _new_connection()
+    _CONNECTION_SCOPE.conn = conn
+    try:
+        yield conn
+    finally:
+        _CONNECTION_SCOPE.conn = None
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _connect():
+    scoped = getattr(_CONNECTION_SCOPE, "conn", None)
+    if scoped is not None:
+        return _ScopedConnectionProxy(scoped)
+    return _new_connection()
 
 # In-memory semantic index cache to avoid loading all vectors on every query.
 _EMBEDDING_CACHE_LOCK = threading.Lock()
@@ -378,6 +433,23 @@ def init_db():
             created_at TEXT
         )
     ''')
+    # Migration: project metadata fields
+    try:
+        c.execute("ALTER TABLE smart_folders ADD COLUMN description TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE smart_folders ADD COLUMN goal TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE smart_folders ADD COLUMN target_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE smart_folders ADD COLUMN status TEXT DEFAULT 'active'")
+    except sqlite3.OperationalError:
+        pass
 
     # Collection digest schedules (per smart folder)
     c.execute('''
@@ -423,6 +495,15 @@ def init_db():
             last_run_at TEXT
         )
     ''')
+    # Migration: semantic/local/global modes for saved-search agents
+    try:
+        c.execute("ALTER TABLE saved_search_agents ADD COLUMN mode TEXT DEFAULT 'global'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE saved_search_agents ADD COLUMN source_paper_id TEXT")
+    except sqlite3.OperationalError:
+        pass
     c.execute('''
         CREATE TABLE IF NOT EXISTS saved_search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -550,6 +631,9 @@ def init_db():
             keywords TEXT,
             authors TEXT,
             venues TEXT,
+            min_novelty REAL DEFAULT 0.0,
+            quiet_hours_start INTEGER DEFAULT -1,
+            quiet_hours_end INTEGER DEFAULT -1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -565,6 +649,18 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE inbox_rules ADD COLUMN snooze_days INTEGER DEFAULT 3")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE inbox_rules ADD COLUMN min_novelty REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE inbox_rules ADD COLUMN quiet_hours_start INTEGER DEFAULT -1")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE inbox_rules ADD COLUMN quiet_hours_end INTEGER DEFAULT -1")
     except sqlite3.OperationalError:
         pass
     c.execute('''
@@ -636,6 +732,20 @@ def init_db():
             note TEXT,
             created_at TEXT NOT NULL,
             done_at TEXT,
+            FOREIGN KEY(paper_id) REFERENCES papers(id)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS paper_assignments (
+            id TEXT PRIMARY KEY,
+            paper_id TEXT NOT NULL,
+            assignee TEXT NOT NULL,
+            due_at TEXT,
+            status TEXT NOT NULL DEFAULT 'todo',
+            note TEXT,
+            last_viewed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             FOREIGN KEY(paper_id) REFERENCES papers(id)
         )
     ''')
@@ -743,6 +853,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_seen_created ON alerts(seen, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_saved_search_agents_updated ON saved_search_agents(updated_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_saved_search_agents_mode ON saved_search_agents(mode)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_saved_search_runs_agent_created ON saved_search_runs(agent_id, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_saved_search_seen_paper ON saved_search_seen(paper_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_collection_digest_schedules_updated ON collection_digest_schedules(updated_at DESC)")
@@ -787,6 +898,8 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_paper_comments_paper ON paper_comments(paper_id, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_comment_mentions_handle_created ON comment_mentions(mention, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_followups_due ON paper_followups(done_at, remind_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_assignments_assignee ON paper_assignments(assignee, status, updated_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_assignments_paper ON paper_assignments(paper_id, updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_paper_links_paper ON paper_links(paper_id, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_paper_links_related ON paper_links(related_id, created_at DESC)")
 
@@ -824,26 +937,73 @@ def init_db():
     except Exception:
         _DB_INITIALIZED_SIGNATURE = None
 
-def create_folder(name: str, query: str, mode: str = 'sql') -> str:
+def create_folder(
+    name: str,
+    query: str,
+    mode: str = 'sql',
+    description: Optional[str] = None,
+    goal: Optional[str] = None,
+    target_count: Optional[int] = None,
+    status: str = "active",
+) -> str:
     conn = _connect()
     c = conn.cursor()
     import uuid
     folder_id = str(uuid.uuid4())
-    c.execute("INSERT INTO smart_folders (id, name, query, mode, created_at) VALUES (?, ?, ?, ?, ?)",
-              (folder_id, name, query, mode, datetime.now().isoformat()))
+    now = datetime.now().isoformat()
+    c.execute(
+        '''
+        INSERT INTO smart_folders (
+            id, name, query, mode, created_at,
+            description, goal, target_count, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            folder_id,
+            name,
+            query,
+            mode,
+            now,
+            (description or "").strip(),
+            (goal or "").strip(),
+            max(0, int(target_count or 0)),
+            (status or "active").strip().lower() or "active",
+        ),
+    )
     conn.commit()
     conn.close()
     return folder_id
 
 def get_folders() -> List[Dict]:
     conn = _connect()
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT id, name, query, mode, created_at FROM smart_folders ORDER BY created_at DESC")
-    rows = c.fetchall()
+    c.execute(
+        '''
+        SELECT id, name, query, mode, created_at, description, goal, target_count, status
+        FROM smart_folders
+        ORDER BY created_at DESC
+        '''
+    )
+    rows = [dict(r) for r in c.fetchall()]
     conn.close()
-    return [{
-        "id": r[0], "name": r[1], "query": r[2], "mode": r[3], "created_at": r[4]
-    } for r in rows]
+    out: List[Dict[str, Any]] = []
+    for rec in rows:
+        out.append(
+            {
+                "id": rec.get("id"),
+                "name": rec.get("name"),
+                "query": rec.get("query"),
+                "mode": rec.get("mode"),
+                "created_at": rec.get("created_at"),
+                "description": rec.get("description") or "",
+                "goal": rec.get("goal") or "",
+                "target_count": int(rec.get("target_count") or 0),
+                "status": (rec.get("status") or "active"),
+            }
+        )
+    return out
 
 def delete_folder(folder_id: str):
     conn = _connect()
@@ -855,13 +1015,76 @@ def delete_folder(folder_id: str):
 
 def get_folder(folder_id: str) -> Dict:
     conn = _connect()
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT id, name, query, mode FROM smart_folders WHERE id = ?", (folder_id,))
+    c.execute(
+        '''
+        SELECT id, name, query, mode, created_at, description, goal, target_count, status
+        FROM smart_folders
+        WHERE id = ?
+        ''',
+        (folder_id,),
+    )
     r = c.fetchone()
     conn.close()
     if r:
-        return {"id": r[0], "name": r[1], "query": r[2], "mode": r[3]}
+        rec = dict(r)
+        return {
+            "id": rec.get("id"),
+            "name": rec.get("name"),
+            "query": rec.get("query"),
+            "mode": rec.get("mode"),
+            "created_at": rec.get("created_at"),
+            "description": rec.get("description") or "",
+            "goal": rec.get("goal") or "",
+            "target_count": int(rec.get("target_count") or 0),
+            "status": rec.get("status") or "active",
+        }
     return None
+
+
+def update_folder(folder_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not folder_id or not isinstance(updates, dict):
+        return None
+    fields: List[str] = []
+    values: List[Any] = []
+    if "name" in updates:
+        fields.append("name = ?")
+        values.append(str(updates.get("name") or "").strip() or "Collection")
+    if "query" in updates:
+        fields.append("query = ?")
+        values.append(str(updates.get("query") or "").strip())
+    if "mode" in updates:
+        fields.append("mode = ?")
+        values.append(str(updates.get("mode") or "sql").strip() or "sql")
+    if "description" in updates:
+        fields.append("description = ?")
+        values.append(str(updates.get("description") or "").strip())
+    if "goal" in updates:
+        fields.append("goal = ?")
+        values.append(str(updates.get("goal") or "").strip())
+    if "target_count" in updates:
+        try:
+            target_count = max(0, int(updates.get("target_count") or 0))
+        except Exception:
+            target_count = 0
+        fields.append("target_count = ?")
+        values.append(target_count)
+    if "status" in updates:
+        status = str(updates.get("status") or "active").strip().lower() or "active"
+        if status not in {"active", "paused", "archived"}:
+            status = "active"
+        fields.append("status = ?")
+        values.append(status)
+    if not fields:
+        return get_folder(folder_id)
+    values.append(folder_id)
+    conn = _connect()
+    c = conn.cursor()
+    c.execute(f"UPDATE smart_folders SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+    return get_folder(folder_id)
 
 def get_folder_digest_schedule(folder_id: str) -> Optional[Dict[str, Any]]:
     if not folder_id:
@@ -1097,7 +1320,9 @@ def get_papers_page_by_status(
     offset: int = 0,
     published_date: Optional[str] = None,
     dedupe_latest: bool = False,
-) -> tuple[List[Dict[str, Any]], int]:
+    query_text: Optional[str] = None,
+    include_total: bool = True,
+) -> tuple[List[Dict[str, Any]], Optional[int]]:
     """
     Returns a paged slice for a status, plus total count.
     When dedupe_latest=True, keeps only latest version per arXiv base id.
@@ -1113,25 +1338,37 @@ def get_papers_page_by_status(
     if published_date:
         date_clause = " AND substr(p.published, 1, 10) = ?"
         params.append(str(published_date))
+    query_clause = ""
+    clean_query = str(query_text or "").strip().lower()
+    if clean_query:
+        query_clause = (
+            " AND lower("
+            "coalesce(p.title, '') || ' ' || coalesce(p.summary, '') || ' ' || coalesce(p.authors, '')"
+            ") LIKE ?"
+        )
+        params.append(f"%{clean_query}%")
+    where_clause = f"{date_clause}{query_clause}"
 
     if not dedupe_latest:
-        c.execute(
-            f'''
-            SELECT COUNT(*)
-            FROM papers p
-            JOIN interactions i ON p.id = i.paper_id
-            WHERE i.status = ?{date_clause}
-            ''',
-            params,
-        )
-        total_row = c.fetchone()
-        total = int(total_row[0]) if total_row else 0
+        total: Optional[int] = None
+        if include_total:
+            c.execute(
+                f'''
+                SELECT COUNT(*)
+                FROM papers p
+                JOIN interactions i ON p.id = i.paper_id
+                WHERE i.status = ?{where_clause}
+                ''',
+                params,
+            )
+            total_row = c.fetchone()
+            total = int(total_row[0]) if total_row else 0
         c.execute(
             f'''
             SELECT p.*, i.status
             FROM papers p
             JOIN interactions i ON p.id = i.paper_id
-            WHERE i.status = ?{date_clause}
+            WHERE i.status = ?{where_clause}
             ORDER BY p.published DESC
             LIMIT ? OFFSET ?
             ''',
@@ -1156,12 +1393,14 @@ def get_papers_page_by_status(
             ) AS _rn
         FROM papers p
         JOIN interactions i ON p.id = i.paper_id
-        WHERE i.status = ?{date_clause}
+        WHERE i.status = ?{where_clause}
     '''
     try:
-        c.execute(f"SELECT COUNT(*) FROM ({ranked_sql}) q WHERE q._rn = 1", params)
-        total_row = c.fetchone()
-        total = int(total_row[0]) if total_row else 0
+        total: Optional[int] = None
+        if include_total:
+            c.execute(f"SELECT COUNT(*) FROM ({ranked_sql}) q WHERE q._rn = 1", params)
+            total_row = c.fetchone()
+            total = int(total_row[0]) if total_row else 0
         c.execute(
             f'''
             SELECT *
@@ -1186,6 +1425,13 @@ def get_papers_page_by_status(
         rows = get_papers_by_status(status=status)
         if published_date:
             rows = [p for p in rows if str(p.get("published", "")).startswith(str(published_date))]
+        if clean_query:
+            rows = [
+                p for p in rows
+                if clean_query in (
+                    f"{p.get('title') or ''} {p.get('summary') or ''} {p.get('authors') or ''}".lower()
+                )
+            ]
         latest: Dict[str, Dict[str, Any]] = {}
         for p in rows:
             base_id = p.get("arxiv_base_id") or _split_arxiv_version(p.get("id"))[0]
@@ -1200,7 +1446,7 @@ def get_papers_page_by_status(
             elif ver == existing_ver and str(p.get("published", "")) > str(existing.get("published", "")):
                 latest[base_id] = p
         deduped = sorted(latest.values(), key=lambda x: x.get("published", ""), reverse=True)
-        total = len(deduped)
+        total = len(deduped) if include_total else None
         return deduped[off: off + lim], total
 
 def get_bookmarked_papers_page(
@@ -1208,7 +1454,9 @@ def get_bookmarked_papers_page(
     offset: int = 0,
     published_date: Optional[str] = None,
     dedupe_latest: bool = False,
-) -> tuple[List[Dict[str, Any]], int]:
+    query_text: Optional[str] = None,
+    include_total: bool = True,
+) -> tuple[List[Dict[str, Any]], Optional[int]]:
     """
     Returns a paged slice for bookmarked papers, plus total count.
     """
@@ -1223,26 +1471,38 @@ def get_bookmarked_papers_page(
     if published_date:
         date_clause = " AND substr(p.published, 1, 10) = ?"
         params.append(str(published_date))
+    query_clause = ""
+    clean_query = str(query_text or "").strip().lower()
+    if clean_query:
+        query_clause = (
+            " AND lower("
+            "coalesce(p.title, '') || ' ' || coalesce(p.summary, '') || ' ' || coalesce(p.authors, '')"
+            ") LIKE ?"
+        )
+        params.append(f"%{clean_query}%")
+    where_clause = f"{date_clause}{query_clause}"
 
     if not dedupe_latest:
-        c.execute(
-            f'''
-            SELECT COUNT(*)
-            FROM papers p
-            JOIN bookmarks b ON p.id = b.paper_id
-            WHERE 1 = 1{date_clause}
-            ''',
-            params,
-        )
-        total_row = c.fetchone()
-        total = int(total_row[0]) if total_row else 0
+        total: Optional[int] = None
+        if include_total:
+            c.execute(
+                f'''
+                SELECT COUNT(*)
+                FROM papers p
+                JOIN bookmarks b ON p.id = b.paper_id
+                WHERE 1 = 1{where_clause}
+                ''',
+                params,
+            )
+            total_row = c.fetchone()
+            total = int(total_row[0]) if total_row else 0
         c.execute(
             f'''
             SELECT p.*, COALESCE(i.status, 'new') AS status
             FROM papers p
             JOIN bookmarks b ON p.id = b.paper_id
             LEFT JOIN interactions i ON p.id = i.paper_id
-            WHERE 1 = 1{date_clause}
+            WHERE 1 = 1{where_clause}
             ORDER BY p.published DESC
             LIMIT ? OFFSET ?
             ''',
@@ -1268,12 +1528,14 @@ def get_bookmarked_papers_page(
         FROM papers p
         JOIN bookmarks b ON p.id = b.paper_id
         LEFT JOIN interactions i ON p.id = i.paper_id
-        WHERE 1 = 1{date_clause}
+        WHERE 1 = 1{where_clause}
     '''
     try:
-        c.execute(f"SELECT COUNT(*) FROM ({ranked_sql}) q WHERE q._rn = 1", params)
-        total_row = c.fetchone()
-        total = int(total_row[0]) if total_row else 0
+        total: Optional[int] = None
+        if include_total:
+            c.execute(f"SELECT COUNT(*) FROM ({ranked_sql}) q WHERE q._rn = 1", params)
+            total_row = c.fetchone()
+            total = int(total_row[0]) if total_row else 0
         c.execute(
             f'''
             SELECT *
@@ -1299,6 +1561,8 @@ def get_bookmarked_papers_page(
             offset=0,
             published_date=published_date,
             dedupe_latest=False,
+            query_text=clean_query,
+            include_total=True,
         )
         latest: Dict[str, Dict[str, Any]] = {}
         for p in rows:
@@ -1314,7 +1578,7 @@ def get_bookmarked_papers_page(
             elif ver == existing_ver and str(p.get("published", "")) > str(existing.get("published", "")):
                 latest[base_id] = p
         deduped = sorted(latest.values(), key=lambda x: x.get("published", ""), reverse=True)
-        total = len(deduped)
+        total = len(deduped) if include_total else None
         return deduped[off: off + lim], total
 
 def update_interaction(paper_id: str, status: str):
@@ -1868,7 +2132,8 @@ def list_inbox_rules(enabled_only: bool = False) -> List[Dict[str, Any]]:
         c.execute(
             '''
             SELECT id, name, enabled, action, label, keywords, authors, venues,
-                   scope, target_kind, snooze_days, created_at, updated_at
+                   scope, target_kind, snooze_days, min_novelty, quiet_hours_start, quiet_hours_end,
+                   created_at, updated_at
             FROM inbox_rules
             WHERE enabled = 1
             ORDER BY updated_at DESC
@@ -1878,7 +2143,8 @@ def list_inbox_rules(enabled_only: bool = False) -> List[Dict[str, Any]]:
         c.execute(
             '''
             SELECT id, name, enabled, action, label, keywords, authors, venues,
-                   scope, target_kind, snooze_days, created_at, updated_at
+                   scope, target_kind, snooze_days, min_novelty, quiet_hours_start, quiet_hours_end,
+                   created_at, updated_at
             FROM inbox_rules
             ORDER BY updated_at DESC
             '''
@@ -1900,6 +2166,20 @@ def list_inbox_rules(enabled_only: bool = False) -> List[Dict[str, Any]]:
         rec["scope"] = str(rec.get("scope") or "papers")
         rec["target_kind"] = str(rec.get("target_kind") or "").strip() or None
         rec["snooze_days"] = max(1, min(int(rec.get("snooze_days") or 3), 90))
+        try:
+            rec["min_novelty"] = max(0.0, min(1.0, float(rec.get("min_novelty") or 0.0)))
+        except Exception:
+            rec["min_novelty"] = 0.0
+        try:
+            start_h = int(rec.get("quiet_hours_start") if rec.get("quiet_hours_start") is not None else -1)
+        except Exception:
+            start_h = -1
+        try:
+            end_h = int(rec.get("quiet_hours_end") if rec.get("quiet_hours_end") is not None else -1)
+        except Exception:
+            end_h = -1
+        rec["quiet_hours_start"] = start_h if 0 <= start_h <= 23 else -1
+        rec["quiet_hours_end"] = end_h if 0 <= end_h <= 23 else -1
         rec["enabled"] = bool(rec.get("enabled"))
         out.append(rec)
     return out
@@ -1908,15 +2188,25 @@ def add_inbox_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
     import uuid
     now = datetime.now().isoformat()
     rule_id = str(uuid.uuid4())
+    def _hour_value(value: Any) -> int:
+        try:
+            hour = int(value)
+        except Exception:
+            return -1
+        return hour if 0 <= hour <= 23 else -1
+
+    quiet_start = _hour_value(rule.get("quiet_hours_start"))
+    quiet_end = _hour_value(rule.get("quiet_hours_end"))
     conn = _connect()
     c = conn.cursor()
     c.execute(
         '''
         INSERT INTO inbox_rules (
             id, name, enabled, action, label, keywords, authors, venues,
-            scope, target_kind, snooze_days, created_at, updated_at
+            scope, target_kind, snooze_days, min_novelty, quiet_hours_start, quiet_hours_end,
+            created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''',
         (
             rule_id,
@@ -1930,6 +2220,9 @@ def add_inbox_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
             str(rule.get("scope") or "papers"),
             (str(rule.get("target_kind") or "").strip() or None),
             max(1, min(int(rule.get("snooze_days") or 3), 90)),
+            max(0.0, min(1.0, float(rule.get("min_novelty") or 0.0))),
+            quiet_start,
+            quiet_end,
             now,
             now,
         ),
@@ -1948,6 +2241,9 @@ def add_inbox_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
         "scope": str(rule.get("scope") or "papers"),
         "target_kind": (str(rule.get("target_kind") or "").strip() or None),
         "snooze_days": max(1, min(int(rule.get("snooze_days") or 3), 90)),
+        "min_novelty": max(0.0, min(1.0, float(rule.get("min_novelty") or 0.0))),
+        "quiet_hours_start": quiet_start,
+        "quiet_hours_end": quiet_end,
         "created_at": now,
         "updated_at": now,
     }
@@ -1987,6 +2283,27 @@ def update_inbox_rule(rule_id: str, updates: Dict[str, Any]) -> Optional[Dict[st
     if "snooze_days" in updates:
         fields.append("snooze_days = ?")
         values.append(max(1, min(int(updates.get("snooze_days") or 3), 90)))
+    if "min_novelty" in updates:
+        try:
+            min_nov = float(updates.get("min_novelty") or 0.0)
+        except Exception:
+            min_nov = 0.0
+        fields.append("min_novelty = ?")
+        values.append(max(0.0, min(1.0, min_nov)))
+    if "quiet_hours_start" in updates:
+        try:
+            start_h = int(updates.get("quiet_hours_start"))
+        except Exception:
+            start_h = -1
+        fields.append("quiet_hours_start = ?")
+        values.append(start_h if 0 <= start_h <= 23 else -1)
+    if "quiet_hours_end" in updates:
+        try:
+            end_h = int(updates.get("quiet_hours_end"))
+        except Exception:
+            end_h = -1
+        fields.append("quiet_hours_end = ?")
+        values.append(end_h if 0 <= end_h <= 23 else -1)
     if not fields:
         return None
     fields.append("updated_at = ?")
@@ -2369,6 +2686,204 @@ def snooze_follow_up(follow_id: str, days: int = 3) -> Optional[Dict[str, Any]]:
     conn.commit()
     conn.close()
     return dict(row) if row else None
+
+
+def add_paper_assignment(
+    paper_id: str,
+    assignee: str,
+    due_at: Optional[str] = None,
+    status: str = "todo",
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not paper_id or not assignee:
+        return {}
+    import uuid
+    assignment_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    status_clean = str(status or "todo").strip().lower() or "todo"
+    if status_clean not in {"todo", "in_progress", "done", "blocked"}:
+        status_clean = "todo"
+    assignee_clean = str(assignee or "").strip().lstrip("@").lower()
+    conn = _connect()
+    c = conn.cursor()
+    c.execute(
+        '''
+        INSERT INTO paper_assignments (
+            id, paper_id, assignee, due_at, status, note,
+            last_viewed_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            assignment_id,
+            paper_id,
+            assignee_clean,
+            (str(due_at).strip() if due_at else None),
+            status_clean,
+            (note or "").strip(),
+            None,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "id": assignment_id,
+        "paper_id": paper_id,
+        "assignee": assignee_clean,
+        "due_at": (str(due_at).strip() if due_at else None),
+        "status": status_clean,
+        "note": (note or "").strip(),
+        "last_viewed_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def list_paper_assignments(
+    paper_id: Optional[str] = None,
+    assignee: Optional[str] = None,
+    status: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    where: List[str] = []
+    params: List[Any] = []
+    if paper_id:
+        where.append("a.paper_id = ?")
+        params.append(str(paper_id).strip())
+    if assignee:
+        where.append("a.assignee = ?")
+        params.append(str(assignee).strip().lstrip("@").lower())
+    if status:
+        status_clean = str(status).strip().lower()
+        where.append("a.status = ?")
+        params.append(status_clean)
+    if unread_only:
+        where.append(
+            "(a.last_viewed_at IS NULL OR a.updated_at > a.last_viewed_at) AND a.status <> 'done'"
+        )
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    c.execute(
+        f'''
+        SELECT
+            a.id, a.paper_id, a.assignee, a.due_at, a.status, a.note,
+            a.last_viewed_at, a.created_at, a.updated_at,
+            p.title, p.published
+        FROM paper_assignments a
+        LEFT JOIN papers p ON p.id = a.paper_id
+        {where_sql}
+        ORDER BY a.updated_at DESC
+        LIMIT ?
+        ''',
+        (*params, lim),
+    )
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    for rec in rows:
+        last_viewed = rec.get("last_viewed_at") or ""
+        updated = rec.get("updated_at") or ""
+        rec["unread"] = bool(not last_viewed or (updated and updated > last_viewed)) and rec.get("status") != "done"
+    return rows
+
+
+def update_paper_assignment(assignment_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not assignment_id or not isinstance(updates, dict):
+        return None
+    fields: List[str] = []
+    values: List[Any] = []
+    if "assignee" in updates:
+        fields.append("assignee = ?")
+        values.append(str(updates.get("assignee") or "").strip().lstrip("@").lower())
+    if "due_at" in updates:
+        due_val = updates.get("due_at")
+        fields.append("due_at = ?")
+        values.append((str(due_val).strip() if due_val else None))
+    if "status" in updates:
+        status_clean = str(updates.get("status") or "todo").strip().lower()
+        if status_clean not in {"todo", "in_progress", "done", "blocked"}:
+            status_clean = "todo"
+        fields.append("status = ?")
+        values.append(status_clean)
+    if "note" in updates:
+        fields.append("note = ?")
+        values.append(str(updates.get("note") or "").strip())
+    if not fields:
+        return None
+    fields.append("updated_at = ?")
+    values.append(datetime.now().isoformat())
+    values.append(assignment_id)
+    conn = _connect()
+    c = conn.cursor()
+    c.execute(f"UPDATE paper_assignments SET {', '.join(fields)} WHERE id = ?", values)
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not changed:
+        return None
+    rows = list_paper_assignments(limit=1_000)
+    for rec in rows:
+        if rec.get("id") == assignment_id:
+            return rec
+    return None
+
+
+def mark_paper_assignment_viewed(assignment_id: str, viewed_at: Optional[str] = None) -> bool:
+    if not assignment_id:
+        return False
+    ts = str(viewed_at or datetime.now().isoformat())
+    conn = _connect()
+    c = conn.cursor()
+    c.execute("UPDATE paper_assignments SET last_viewed_at = ? WHERE id = ?", (ts, assignment_id))
+    conn.commit()
+    ok = c.rowcount > 0
+    conn.close()
+    return ok
+
+
+def get_assignment_meta_map(paper_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not paper_ids:
+        return {}
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    out: Dict[str, Dict[str, Any]] = {}
+    for chunk in _chunked(paper_ids, 300):
+        placeholders = ",".join(["?"] * len(chunk))
+        c.execute(
+            f'''
+            SELECT paper_id, assignee, status, updated_at, last_viewed_at
+            FROM paper_assignments
+            WHERE paper_id IN ({placeholders})
+            ''',
+            chunk,
+        )
+        for row in c.fetchall():
+            rec = dict(row)
+            pid = str(rec.get("paper_id") or "")
+            if not pid:
+                continue
+            meta = out.setdefault(
+                pid,
+                {"open_count": 0, "unread_count": 0, "assignees": []},
+            )
+            status = str(rec.get("status") or "").lower()
+            assignee = str(rec.get("assignee") or "")
+            if assignee and assignee not in meta["assignees"]:
+                meta["assignees"].append(assignee)
+            if status != "done":
+                meta["open_count"] += 1
+            viewed = rec.get("last_viewed_at") or ""
+            updated = rec.get("updated_at") or ""
+            if status != "done" and (not viewed or (updated and updated > viewed)):
+                meta["unread_count"] += 1
+    conn.close()
+    return out
 
 def add_paper_link(
     paper_id: str,
@@ -3972,6 +4487,140 @@ def search_semantic(query_embedding: np.ndarray, limit: int = 50) -> List[Dict[s
         
     return results
 
+
+def get_related_papers(paper_id: str, limit: int = 20, min_score: float = 0.65) -> List[Dict[str, Any]]:
+    """
+    Returns top related papers by embedding similarity for a given paper.
+    """
+    if not paper_id:
+        return []
+    ids, matrix, id_to_idx = _load_embedding_matrix()
+    if matrix.size == 0 or not ids:
+        return []
+    anchor_idx = id_to_idx.get(paper_id)
+    if anchor_idx is None:
+        return []
+    try:
+        lim = max(1, min(int(limit), 80))
+    except Exception:
+        lim = 20
+    try:
+        threshold = float(min_score)
+    except Exception:
+        threshold = 0.65
+    threshold = max(-1.0, min(1.0, threshold))
+
+    anchor_vec = matrix[anchor_idx]
+    scores = np.dot(matrix, anchor_vec)
+    order = np.argsort(scores)[::-1]
+    chosen: List[tuple[str, float]] = []
+    for idx in order:
+        pid = ids[idx]
+        if pid == paper_id:
+            continue
+        score = float(scores[idx])
+        if score < threshold:
+            continue
+        chosen.append((pid, score))
+        if len(chosen) >= lim:
+            break
+    if not chosen:
+        return []
+
+    paper_map = {p.get("id"): p for p in get_papers_by_ids([pid for pid, _ in chosen]) if p.get("id")}
+    out: List[Dict[str, Any]] = []
+    for pid, score in chosen:
+        paper = paper_map.get(pid) or {}
+        out.append(
+            {
+                "id": pid,
+                "score": round(float(score), 4),
+                "title": paper.get("title") or pid,
+                "published": paper.get("published") or "",
+                "categories": paper.get("categories") or [],
+            }
+        )
+    return out
+
+
+def build_related_graph(
+    paper_ids: List[str],
+    limit_per_anchor: int = 8,
+    min_score: float = 0.68,
+) -> Dict[str, Any]:
+    """
+    Embedding-similarity graph for selected papers plus their nearest neighbors.
+    """
+    if not paper_ids:
+        return {"nodes": [], "edges": []}
+    ids, matrix, id_to_idx = _load_embedding_matrix()
+    if matrix.size == 0 or not ids:
+        return {"nodes": [], "edges": []}
+
+    try:
+        per_anchor = max(1, min(int(limit_per_anchor), 20))
+    except Exception:
+        per_anchor = 8
+    try:
+        threshold = float(min_score)
+    except Exception:
+        threshold = 0.68
+    threshold = max(-1.0, min(1.0, threshold))
+
+    anchors = [pid for pid in paper_ids if pid in id_to_idx]
+    if not anchors:
+        return {"nodes": [], "edges": []}
+
+    edges: Dict[tuple[str, str], float] = {}
+    node_ids: set[str] = set(anchors)
+
+    for anchor in anchors:
+        anchor_idx = id_to_idx[anchor]
+        anchor_vec = matrix[anchor_idx]
+        scores = np.dot(matrix, anchor_vec)
+        order = np.argsort(scores)[::-1]
+        added = 0
+        for idx in order:
+            other_id = ids[idx]
+            if other_id == anchor:
+                continue
+            score = float(scores[idx])
+            if score < threshold:
+                continue
+            node_ids.add(other_id)
+            key = tuple(sorted((anchor, other_id)))
+            prev = edges.get(key)
+            if prev is None or score > prev:
+                edges[key] = score
+            added += 1
+            if added >= per_anchor:
+                break
+
+    paper_map = {p.get("id"): p for p in get_papers_by_ids(list(node_ids)) if p.get("id")}
+    nodes: List[Dict[str, Any]] = []
+    for pid in node_ids:
+        p = paper_map.get(pid) or {}
+        nodes.append(
+            {
+                "id": pid,
+                "title": p.get("title") or pid,
+                "published": p.get("published") or "",
+                "group": "anchor" if pid in anchors else "related",
+            }
+        )
+    edge_rows = [
+        {
+            "from": a,
+            "to": b,
+            "score": round(float(score), 4),
+            "label": f"sim {float(score):.2f}",
+        }
+        for (a, b), score in edges.items()
+    ]
+    edge_rows.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    nodes.sort(key=lambda x: (0 if x.get("group") == "anchor" else 1, x.get("title") or ""))
+    return {"nodes": nodes, "edges": edge_rows}
+
 def compute_novelty_scores(paper_ids: List[str], reference_status: str = "liked") -> Dict[str, float]:
     """
     Computes novelty in [0,1] for target papers against a reference set.
@@ -4461,16 +5110,37 @@ def get_changes_since(since_iso: str, limit: int = 6) -> Dict[str, Any]:
         "citation_updates": citation_updates,
     }
 
-def create_saved_search_agent(name: str, query: str, cadence: str = "daily", max_results: int = 8) -> int:
+def create_saved_search_agent(
+    name: str,
+    query: str,
+    cadence: str = "daily",
+    max_results: int = 8,
+    mode: str = "global",
+    source_paper_id: Optional[str] = None,
+) -> int:
+    mode_clean = str(mode or "global").strip().lower() or "global"
+    if mode_clean not in {"global", "semantic", "local"}:
+        mode_clean = "global"
     conn = _connect()
     c = conn.cursor()
     now = datetime.now().isoformat()
     c.execute(
         '''
-        INSERT INTO saved_search_agents (name, query, cadence, max_results, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO saved_search_agents (
+            name, query, cadence, max_results, mode, source_paper_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''',
-        (name, query, cadence, max(1, int(max_results)), now, now),
+        (
+            name,
+            query,
+            cadence,
+            max(1, int(max_results)),
+            mode_clean,
+            (str(source_paper_id or "").strip() or None),
+            now,
+            now,
+        ),
     )
     agent_id = int(c.lastrowid)
     conn.commit()
@@ -4483,7 +5153,8 @@ def list_saved_search_agents() -> List[Dict[str, Any]]:
     c = conn.cursor()
     c.execute(
         '''
-        SELECT a.id, a.name, a.query, a.cadence, a.max_results, a.created_at, a.updated_at, a.last_run_at,
+        SELECT a.id, a.name, a.query, a.cadence, a.max_results, a.mode, a.source_paper_id,
+               a.created_at, a.updated_at, a.last_run_at,
                r.summary AS last_summary, r.matches_count AS last_matches_count
         FROM saved_search_agents a
         LEFT JOIN saved_search_runs r
@@ -4498,6 +5169,12 @@ def list_saved_search_agents() -> List[Dict[str, Any]]:
     )
     rows = [dict(row) for row in c.fetchall()]
     conn.close()
+    for rec in rows:
+        mode = str(rec.get("mode") or "global").strip().lower() or "global"
+        if mode not in {"global", "semantic", "local"}:
+            mode = "global"
+        rec["mode"] = mode
+        rec["source_paper_id"] = (rec.get("source_paper_id") or None)
     return rows
 
 def get_saved_search_agent(agent_id: int) -> Optional[Dict[str, Any]]:
@@ -4506,7 +5183,8 @@ def get_saved_search_agent(agent_id: int) -> Optional[Dict[str, Any]]:
     c = conn.cursor()
     c.execute(
         '''
-        SELECT id, name, query, cadence, max_results, created_at, updated_at, last_run_at
+        SELECT id, name, query, cadence, max_results, mode, source_paper_id,
+               created_at, updated_at, last_run_at
         FROM saved_search_agents
         WHERE id = ?
         ''',
@@ -4514,7 +5192,15 @@ def get_saved_search_agent(agent_id: int) -> Optional[Dict[str, Any]]:
     )
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    rec = dict(row)
+    mode = str(rec.get("mode") or "global").strip().lower() or "global"
+    if mode not in {"global", "semantic", "local"}:
+        mode = "global"
+    rec["mode"] = mode
+    rec["source_paper_id"] = (rec.get("source_paper_id") or None)
+    return rec
 
 def delete_saved_search_agent(agent_id: int):
     conn = _connect()
@@ -4678,7 +5364,11 @@ def get_digest_run(digest_id: int) -> Optional[Dict[str, Any]]:
     conn.close()
     return run
 
-def list_digest_runs(limit: int = 20, cadence: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_digest_runs(
+    limit: int = 20,
+    cadence: Optional[str] = None,
+    include_items: bool = True,
+) -> List[Dict[str, Any]]:
     conn = _connect()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -4712,37 +5402,38 @@ def list_digest_runs(limit: int = 20, cadence: Optional[str] = None) -> List[Dic
         )
     runs = [dict(r) for r in c.fetchall()]
 
-    digest_ids = [int(r["id"]) for r in runs]
     items_by_digest: Dict[int, List[Dict[str, Any]]] = {}
-    if digest_ids:
-        for chunk in _chunked(digest_ids, 300):
-            placeholders = ",".join(["?"] * len(chunk))
-            c.execute(
-                f'''
-                SELECT digest_id, item_rank, paper_id, title, reason, score, contributors
-                FROM digest_items
-                WHERE digest_id IN ({placeholders})
-                ORDER BY digest_id DESC, item_rank ASC
-                ''',
-                chunk,
-            )
-            for row in c.fetchall():
-                item = dict(row)
-                raw = item.get("contributors")
-                if raw:
-                    try:
-                        item["contributors"] = json.loads(raw)
-                    except Exception:
+    if include_items:
+        digest_ids = [int(r["id"]) for r in runs]
+        if digest_ids:
+            for chunk in _chunked(digest_ids, 300):
+                placeholders = ",".join(["?"] * len(chunk))
+                c.execute(
+                    f'''
+                    SELECT digest_id, item_rank, paper_id, title, reason, score, contributors
+                    FROM digest_items
+                    WHERE digest_id IN ({placeholders})
+                    ORDER BY digest_id DESC, item_rank ASC
+                    ''',
+                    chunk,
+                )
+                for row in c.fetchall():
+                    item = dict(row)
+                    raw = item.get("contributors")
+                    if raw:
+                        try:
+                            item["contributors"] = json.loads(raw)
+                        except Exception:
+                            item["contributors"] = None
+                    else:
                         item["contributors"] = None
-                else:
-                    item["contributors"] = None
-                did = int(item.pop("digest_id"))
-                items_by_digest.setdefault(did, []).append(item)
+                    did = int(item.pop("digest_id"))
+                    items_by_digest.setdefault(did, []).append(item)
     conn.close()
 
     for run in runs:
         did = int(run["id"])
-        run["items"] = items_by_digest.get(did, [])
+        run["items"] = items_by_digest.get(did, []) if include_items else []
         run["unread"] = run.get("read_at") in (None, "")
     return runs
 

@@ -57,6 +57,9 @@ class InboxRuleRequest(BaseModel):
     scope: str = "papers"  # papers or inbox
     target_kind: Optional[str] = None  # alert|version_update|follow_up|digest
     snooze_days: int = 3
+    min_novelty: float = 0.0
+    quiet_hours_start: Optional[int] = None
+    quiet_hours_end: Optional[int] = None
 
 class PinRequest(BaseModel):
     note: Optional[str] = None
@@ -72,6 +75,7 @@ class ReadingStatusRequest(BaseModel):
 class ReadingPlanGenerateRequest(BaseModel):
     total_minutes: int = 60
     max_items: int = 6
+    budget_mode: str = "balanced"  # balanced | focus | sprint | deep
     include_new: bool = True
     include_liked: bool = True
     include_bookmarked: bool = True
@@ -165,6 +169,12 @@ class LinkRequest(BaseModel):
 class NotesImportRequest(BaseModel):
     items: List[Dict[str, Any]] = []
 
+class NotesTemplatesRequest(BaseModel):
+    templates: List[Dict[str, Any]] = []
+
+class NotesAutoSummaryRequest(BaseModel):
+    style: str = "concise"  # concise | structured | deep
+
 class ViewShareRequest(BaseModel):
     name: Optional[str] = None
     status: str = "new"
@@ -198,6 +208,8 @@ class SavedSearchRequest(BaseModel):
     query: str
     cadence: str = "daily"  # daily | weekly
     max_results: int = 8
+    mode: str = "global"  # global | semantic | local
+    source_paper_id: Optional[str] = None
 
 class ReproJobRequest(BaseModel):
     paper_id: str
@@ -246,6 +258,33 @@ class WeeklyPickRequest(BaseModel):
 
 class NotionExportRequest(BaseModel):
     paper_ids: List[str]
+
+
+class CrossPaperQARequest(BaseModel):
+    paper_ids: List[str]
+    question: str
+    top_k: int = 5
+
+
+class RelatedGraphRequest(BaseModel):
+    paper_ids: List[str]
+    limit_per_anchor: int = 8
+    min_score: float = 0.68
+
+
+class AssignmentRequest(BaseModel):
+    assignee: str
+    due_in_days: Optional[int] = None
+    due_at: Optional[str] = None
+    status: str = "todo"
+    note: Optional[str] = None
+
+
+class AssignmentUpdateRequest(BaseModel):
+    assignee: Optional[str] = None
+    due_at: Optional[str] = None
+    status: Optional[str] = None
+    note: Optional[str] = None
 
 def normalize_paper_id(paper_id: str) -> str:
     """Normalizes short arXiv ids into the DB's URL-style id format."""
@@ -410,6 +449,24 @@ LOG_FILE_PREFIX = "events"
 LOG_RETENTION_DAYS = 7
 READING_PLAN_CACHE_TTL_SECONDS = 24 * 3600
 READING_PLAN_LAST_OPTIONS_KEY = "reading_plan:today:last_options"
+NOTES_TEMPLATES_CACHE_KEY = "notes:templates:v1"
+DEFAULT_NOTES_TEMPLATES: List[Dict[str, str]] = [
+    {
+        "id": "reading",
+        "name": "Reading Notes",
+        "body": "## TL;DR\n- \n\n## Key Ideas\n- \n\n## Evidence\n- \n\n## Questions\n- \n\n## Next Actions\n- ",
+    },
+    {
+        "id": "replication",
+        "name": "Replication Checklist",
+        "body": "## Setup\n- Data source:\n- Code repository:\n- Environment:\n\n## Repro Steps\n1. \n2. \n3. \n\n## Risks\n- \n\n## Result Log\n- ",
+    },
+    {
+        "id": "meeting",
+        "name": "Team Discussion",
+        "body": "## Decision\n- \n\n## Pros\n- \n\n## Cons\n- \n\n## Open Questions\n- \n\n## Owner & Due Date\n- ",
+    },
+]
 _LOG_LOCK = threading.Lock()
 _LOG_CURRENT_DATE = None
 _LOG_FILE_PATH = None
@@ -533,15 +590,25 @@ def _run_discover_pipeline() -> Dict[str, Any]:
         print(f"AI Error during discovery: {e}")
         queries = ["cat:cs.AI"]
 
-    candidates = []
-    seen_ids = set()
+    candidates: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    query_hits_by_id: Dict[str, List[str]] = {}
+    rank_hint_by_id: Dict[str, int] = {}
     for q in queries:
         try:
             results = client.search_archive(q, max_results=5)
-            for p in results:
-                if p['id'] not in seen_ids:
+            for idx, p in enumerate(results):
+                pid = str(p.get("id") or "").strip()
+                if not pid:
+                    continue
+                query_hits_by_id.setdefault(pid, [])
+                if q not in query_hits_by_id[pid]:
+                    query_hits_by_id[pid].append(q)
+                prev_rank = rank_hint_by_id.get(pid)
+                rank_hint_by_id[pid] = min(prev_rank, idx + 1) if prev_rank is not None else (idx + 1)
+                if pid not in seen_ids:
                     candidates.append(p)
-                    seen_ids.add(p['id'])
+                    seen_ids.add(pid)
         except Exception as search_err:
             print(f"Search Error for {q}: {search_err}")
 
@@ -554,7 +621,52 @@ def _run_discover_pipeline() -> Dict[str, Any]:
             if c['id'] not in existing_ids:
                 filtered_results.append(c)
 
-    return {"papers": filtered_results[:20], "queries": queries}
+    keywords = [str(k).strip().lower() for k in (config.KEYWORDS or []) if str(k).strip()]
+    followed_authors = set(storage.get_followed_authors() or [])
+    enriched: List[Dict[str, Any]] = []
+    for paper in filtered_results:
+        pid = str(paper.get("id") or "").strip()
+        title = str(paper.get("title") or "")
+        summary = str(paper.get("summary") or "")
+        text = f"{title} {summary}".lower()
+        authors = paper.get("authors") or []
+        if isinstance(authors, str):
+            authors = [authors]
+        kw_hits = [kw for kw in keywords if kw in text][:4]
+        author_hits = [a for a in authors if a in followed_authors][:3]
+        query_hits = query_hits_by_id.get(pid) or []
+        rank_hint = rank_hint_by_id.get(pid) or 6
+
+        reasons: List[str] = []
+        if query_hits:
+            reasons.append(f"Matched discovery query: {query_hits[0]}")
+        if kw_hits:
+            reasons.append(f"Keyword overlap: {', '.join(kw_hits[:3])}")
+        if author_hits:
+            reasons.append(f"Followed author: {', '.join(author_hits[:2])}")
+        if not reasons:
+            reasons.append("Semantically related to your recent library interests.")
+
+        score = 0.0
+        score += max(0.0, 2.0 - (float(rank_hint) - 1.0) * 0.25)
+        score += min(1.2, float(len(query_hits)) * 0.35)
+        score += min(1.0, float(len(kw_hits)) * 0.25)
+        score += min(0.8, float(len(author_hits)) * 0.4)
+
+        paper_copy = dict(paper)
+        paper_copy["recommendation_score"] = round(score, 3)
+        paper_copy["recommendation_reasons"] = reasons
+        paper_copy["discovery_queries"] = query_hits
+        enriched.append(paper_copy)
+
+    enriched.sort(
+        key=lambda row: (
+            float(row.get("recommendation_score") or 0.0),
+            str(row.get("published") or ""),
+        ),
+        reverse=True,
+    )
+    return {"papers": enriched[:20], "queries": queries}
 
 def _compute_compare_matrix(paper_ids: List[str]) -> Dict[str, Any]:
     """Compare matrix for 2-6 selected papers with caching."""
@@ -616,6 +728,131 @@ def _compute_compare_diff(paper_ids: List[str]) -> Dict[str, Any]:
     fields = ["method", "dataset", "results"]
     diffs = {f: (a["structure"].get(f) or "").strip() != (b["structure"].get(f) or "").strip() for f in fields}
     return {"papers": [a, b], "diffs": diffs}
+
+def _run_cross_paper_qa(
+    paper_ids: List[str],
+    question: str,
+    top_k: int = 5,
+) -> Dict[str, Any]:
+    storage.init_db()
+    clean_question = str(question or "").strip()
+    if not clean_question:
+        raise HTTPException(status_code=400, detail="question is required.")
+
+    normalized_ids = normalize_paper_ids(paper_ids or [])
+    if len(normalized_ids) < 2:
+        raise HTTPException(status_code=400, detail="Select at least 2 papers.")
+
+    paper_rows = storage.get_papers_by_ids(normalized_ids)
+    paper_map = {p.get("id"): p for p in paper_rows if p.get("id")}
+    papers = [paper_map[pid] for pid in normalized_ids if pid in paper_map]
+    if len(papers) < 2:
+        raise HTTPException(status_code=404, detail="Not enough selected papers found.")
+
+    question_tokens = {
+        tok.lower()
+        for tok in re.findall(r"[a-zA-Z0-9][\\w-]{2,}", clean_question)
+        if len(tok) >= 3
+    }
+    scored: List[Dict[str, Any]] = []
+    for paper in papers:
+        title = str(paper.get("title") or "")
+        summary = str(paper.get("summary") or "")
+        text = f"{title} {summary}".lower()
+        token_hits = sum(1 for tok in question_tokens if tok in text) if question_tokens else 0
+        recency_bonus = 0.0
+        pub = str(paper.get("published") or "")
+        if pub:
+            recency_bonus = 0.25
+        score = float(token_hits) + recency_bonus
+        first_sentence = summary.split(".")[0].strip() if summary else ""
+        scored.append(
+            {
+                "paper_id": paper.get("id"),
+                "title": title or str(paper.get("id") or "Paper"),
+                "published": pub,
+                "score": round(score, 4),
+                "snippet": first_sentence or summary[:320],
+                "summary": summary,
+            }
+        )
+
+    scored.sort(key=lambda row: (float(row.get("score") or 0.0), str(row.get("published") or "")), reverse=True)
+    source_cap = max(1, min(int(top_k or 5), 12, len(scored)))
+    selected_sources = scored[:source_cap]
+
+    signature_payload = {
+        "ids": [str(p.get("paper_id") or "") for p in selected_sources],
+        "q": clean_question,
+        "top_k": source_cap,
+    }
+    cache_key = "cross_qa:" + hashlib.sha1(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    cached = storage.get_ai_cache(cache_key, max_age_seconds=3 * 24 * 3600)
+    if cached:
+        try:
+            payload = json.loads(cached)
+            if isinstance(payload, dict):
+                payload["cached"] = True
+                return payload
+        except Exception:
+            pass
+
+    context_lines: List[str] = []
+    for idx, source in enumerate(selected_sources, start=1):
+        context_lines.append(
+            "\n".join(
+                [
+                    f"[S{idx}] ID: {source.get('paper_id')}",
+                    f"Title: {source.get('title')}",
+                    f"Published: {source.get('published')}",
+                    f"Abstract: {source.get('summary')}",
+                ]
+            )
+        )
+    prompt = (
+        "You are an academic research assistant. Answer the question using ONLY the provided sources.\n"
+        "Cite supporting claims inline with source tags like [S1], [S2].\n"
+        "If evidence is weak or missing, say so explicitly.\n\n"
+        f"Question: {clean_question}\n\n"
+        "Sources:\n"
+        + "\n\n".join(context_lines)
+        + "\n\nAnswer:"
+    )
+    answer = (ai_service.query_ollama(prompt, "", timeout=150) or "").strip()
+    if not answer:
+        fallback_points: List[str] = []
+        for idx, source in enumerate(selected_sources[:4], start=1):
+            fallback_points.append(
+                f"- [S{idx}] {source.get('title')}: {source.get('snippet') or 'No abstract snippet available.'}"
+            )
+        answer = (
+            "AI response unavailable. Here are the most relevant selected-paper snippets:\n\n"
+            + "\n".join(fallback_points)
+        )
+
+    payload = {
+        "question": clean_question,
+        "answer": answer,
+        "count_selected": len(papers),
+        "count_sources": len(selected_sources),
+        "sources": [
+            {
+                "tag": f"S{idx}",
+                "paper_id": source.get("paper_id"),
+                "title": source.get("title"),
+                "published": source.get("published"),
+                "relevance_score": source.get("score"),
+                "snippet": source.get("snippet"),
+            }
+            for idx, source in enumerate(selected_sources, start=1)
+        ],
+        "cached": False,
+    }
+    try:
+        storage.set_ai_cache(cache_key, json.dumps(payload))
+    except Exception:
+        pass
+    return payload
 
 def _compute_reproducibility_scorecard(paper_id: str) -> Dict[str, Any]:
     storage.init_db()
@@ -1115,6 +1352,7 @@ def _attach_version_change_fields(papers: List[Dict[str, Any]]) -> None:
         rows.sort(key=_version_sort_key, reverse=True)
         by_base[base] = rows
 
+    paper_by_id = {str(p.get("id") or ""): p for p in papers if p.get("id")}
     compare_pairs: List[tuple[str, Dict[str, Any], Dict[str, Any], bool]] = []
     needed_ids: Dict[str, Dict[str, Any]] = {}
     for p in papers:
@@ -1183,7 +1421,7 @@ def _attach_version_change_fields(papers: List[Dict[str, Any]]) -> None:
         if not isinstance(to_struct, dict):
             to_struct = {}
         changed = _compare_structure_fields(from_struct, to_struct)
-        paper = next((row for row in papers if str(row.get("id") or "") == pid), None)
+        paper = paper_by_id.get(pid)
         if not paper:
             continue
         paper["version_changed_fields"] = changed
@@ -1285,6 +1523,7 @@ def _build_version_updates_payload(
     scope: str = "watchlist",
     limit: int = 100,
     include_triaged: bool = False,
+    count_only: bool = False,
 ) -> Dict[str, Any]:
     lim = max(1, min(int(limit or 100), 300))
     scope_key = (scope or "watchlist").lower()
@@ -1298,15 +1537,37 @@ def _build_version_updates_payload(
         except Exception:
             raise HTTPException(status_code=400, detail="since must be ISO datetime or YYYY-MM-DD")
 
+    def _empty_payload() -> Dict[str, Any]:
+        return {
+            "scope": scope_key,
+            "since": since_dt.isoformat() if since_dt else None,
+            "count": 0,
+            "active_count": 0,
+            "triaged_count": 0,
+            "total_count": 0,
+            "items": [],
+        }
+
     def _load_scope_rows(name: str) -> List[Dict[str, Any]]:
         if name == "liked":
             return storage.get_papers_by_status("liked")
         if name == "new":
-            rows, _ = storage.get_papers_page_by_status(status="new", limit=500, offset=0, dedupe_latest=True)
+            rows, _ = storage.get_papers_page_by_status(
+                status="new",
+                limit=500,
+                offset=0,
+                dedupe_latest=True,
+                include_total=False,
+            )
             return rows
         if name == "bookmarked":
-            ids = storage.get_bookmarked_ids()
-            return storage.get_papers_by_ids(ids) if ids else []
+            rows, _ = storage.get_bookmarked_papers_page(
+                limit=5000,
+                offset=0,
+                dedupe_latest=False,
+                include_total=False,
+            )
+            return rows
         return []
 
     if scope_key == "watchlist":
@@ -1334,15 +1595,7 @@ def _build_version_updates_payload(
 
     base_ids = list(tracked_by_base.keys())
     if not base_ids:
-        return {
-            "scope": scope_key,
-            "since": since_dt.isoformat() if since_dt else None,
-            "count": 0,
-            "active_count": 0,
-            "triaged_count": 0,
-            "total_count": 0,
-            "items": [],
-        }
+        return _empty_payload()
 
     today_iso = datetime.now().date().isoformat()
     triage_map = storage.get_version_update_state_map(base_ids, on_date=today_iso)
@@ -1357,7 +1610,7 @@ def _build_version_updates_payload(
             latest_by_base[base] = row
 
     needed_rows: Dict[str, Dict[str, Any]] = {}
-    pairs: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+    pairs: List[tuple[str, Dict[str, Any], Dict[str, Any]]] = []
     for base, tracked in tracked_by_base.items():
         latest = latest_by_base.get(base)
         if not latest:
@@ -1377,24 +1630,36 @@ def _build_version_updates_payload(
             latest_date = latest_pub.date() if latest_pub is not None else None
             if latest_date is None or latest_date < since_date:
                 continue
-        pairs.append((tracked, latest))
-        needed_rows[str(tracked.get("id") or "")] = tracked
-        needed_rows[str(latest.get("id") or "")] = latest
+        pairs.append((base, tracked, latest))
+        if not count_only:
+            needed_rows[str(tracked.get("id") or "")] = tracked
+            needed_rows[str(latest.get("id") or "")] = latest
 
     if not pairs:
+        return _empty_payload()
+
+    if count_only:
+        total_count = len(pairs)
+        active_count = 0
+        for base_id, _tracked, _latest in pairs:
+            triage_state = triage_map.get(base_id) or {}
+            if _version_update_state_active(triage_state, today_iso):
+                active_count += 1
+        triaged_count = max(0, total_count - active_count)
+        selected_count = total_count if include_triaged else active_count
         return {
             "scope": scope_key,
             "since": since_dt.isoformat() if since_dt else None,
-            "count": 0,
-            "active_count": 0,
-            "triaged_count": 0,
-            "total_count": 0,
+            "count": min(lim, selected_count),
+            "active_count": active_count,
+            "triaged_count": triaged_count,
+            "total_count": total_count,
             "items": [],
         }
 
     structures = _ensure_structures_for_papers(list(needed_rows.values()), refresh=False)
     all_items: List[Dict[str, Any]] = []
-    for tracked, latest in pairs:
+    for pair_base_id, tracked, latest in pairs:
         tracked_id = str(tracked.get("id") or "")
         latest_id = str(latest.get("id") or "")
         tracked_struct = structures.get(tracked_id) or tracked.get("structure") or {}
@@ -1404,7 +1669,7 @@ def _build_version_updates_payload(
         if not isinstance(latest_struct, dict):
             latest_struct = {}
         changed = _compare_structure_fields(tracked_struct, latest_struct)
-        base_id = str(latest.get("arxiv_base_id") or tracked.get("arxiv_base_id") or "")
+        base_id = str(pair_base_id or latest.get("arxiv_base_id") or tracked.get("arxiv_base_id") or "")
         triage_state = triage_map.get(base_id) or {}
         triage_active = _version_update_state_active(triage_state, today_iso)
         triage_status = str(triage_state.get("status") or ("active" if triage_active else "reviewed"))
@@ -1600,15 +1865,27 @@ def _coerce_naive_local(dt: Optional[datetime]) -> Optional[datetime]:
             return dt.replace(tzinfo=None)
     return dt
 
-def _inbox_sort_epoch(item: Dict[str, Any]) -> float:
+def _resolve_inbox_item_time(item: Dict[str, Any]) -> Optional[datetime]:
     if not isinstance(item, dict):
-        return 0.0
+        return None
     dt = (
         _coerce_iso_datetime(item.get("_sort_ts"))
         or _coerce_iso_datetime(item.get("remind_at"))
         or _coerce_iso_datetime(item.get("created_at"))
         or _coerce_iso_datetime(item.get("published"))
     )
+    return _coerce_naive_local(dt)
+
+def _inbox_sort_epoch(item: Dict[str, Any]) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    cached = item.get("_sort_epoch")
+    if cached is not None:
+        try:
+            return float(cached)
+        except Exception:
+            pass
+    dt = _resolve_inbox_item_time(item)
     if not dt:
         return 0.0
     try:
@@ -1616,11 +1893,15 @@ def _inbox_sort_epoch(item: Dict[str, Any]) -> float:
     except Exception:
         return 0.0
 
-def _priority_for_unified_inbox_item(item: Dict[str, Any]) -> tuple[int, str]:
+def _priority_for_unified_inbox_item(
+    item: Dict[str, Any],
+    now: Optional[datetime] = None,
+    time_ref: Optional[datetime] = None,
+) -> tuple[int, str]:
     if not isinstance(item, dict):
         return 0, ""
     kind = _normalize_inbox_kind(item.get("kind"))
-    now = datetime.now()
+    now_dt = _coerce_naive_local(now) or datetime.now()
     score = {
         "follow_up": 70,
         "version_update": 60,
@@ -1629,15 +1910,9 @@ def _priority_for_unified_inbox_item(item: Dict[str, Any]) -> tuple[int, str]:
     }.get(kind, 30)
     reasons: List[str] = []
 
-    time_ref = _coerce_naive_local(
-        (
-        _coerce_iso_datetime(item.get("remind_at"))
-        or _coerce_iso_datetime(item.get("created_at"))
-        or _coerce_iso_datetime(item.get("published"))
-        )
-    )
-    if time_ref:
-        age_hours = max(0.0, (now - time_ref).total_seconds() / 3600.0)
+    item_time = _coerce_naive_local(time_ref) or _resolve_inbox_item_time(item)
+    if item_time:
+        age_hours = max(0.0, (now_dt - item_time).total_seconds() / 3600.0)
         if age_hours <= 12:
             score += 14
             reasons.append("very recent")
@@ -1650,7 +1925,7 @@ def _priority_for_unified_inbox_item(item: Dict[str, Any]) -> tuple[int, str]:
     if kind == "follow_up":
         due_at = _coerce_naive_local(_coerce_iso_datetime(item.get("remind_at")))
         if due_at:
-            overdue_hours = (now - due_at).total_seconds() / 3600.0
+            overdue_hours = (now_dt - due_at).total_seconds() / 3600.0
             if overdue_hours >= 0:
                 overdue_days = min(14.0, overdue_hours / 24.0)
                 score += min(18, int(round(overdue_days * 3.0)) + 5)
@@ -1721,19 +1996,21 @@ def _build_unified_inbox_payload(
     since = (datetime.now().date() - timedelta(days=days - 1)).isoformat()
     selected_kinds = _parse_inbox_kind_list(None, kinds)
     selected_set = set(selected_kinds)
-    count_alerts = storage.count_unseen_alerts() if "alert" in selected_set else 0
-    count_followups = storage.count_follow_ups_due() if "follow_up" in selected_set else 0
-    count_digests = storage.count_unread_digests() if "digest" in selected_set else 0
-    versions_payload = (
-        _build_version_updates_payload(
-            since=since,
-            scope=version_scope,
-            limit=per_kind * 3,
-            include_triaged=False,
+    with storage.connection_scope():
+        count_alerts = storage.count_unseen_alerts() if "alert" in selected_set else 0
+        count_followups = storage.count_follow_ups_due() if "follow_up" in selected_set else 0
+        count_digests = storage.count_unread_digests() if "digest" in selected_set else 0
+        versions_payload = (
+            _build_version_updates_payload(
+                since=since,
+                scope=version_scope,
+                limit=(per_kind * 3) if include_items else 1,
+                include_triaged=False,
+                count_only=not include_items,
+            )
+            if "version_update" in selected_set
+            else {"items": [], "active_count": 0}
         )
-        if "version_update" in selected_set
-        else {"items": [], "active_count": 0}
-    )
     version_items = list(versions_payload.get("items") or [])
     version_active = int(versions_payload.get("active_count") or len(version_items))
 
@@ -1758,12 +2035,13 @@ def _build_unified_inbox_payload(
             "sort": sort_mode,
         }
 
-    alerts = storage.get_alerts(limit=per_kind * 3, unseen_only=True) if "alert" in selected_set else []
-    followups = storage.list_follow_ups(due_only=True, limit=per_kind * 3) if "follow_up" in selected_set else []
-    unread_digests: List[Dict[str, Any]] = []
-    if "digest" in selected_set:
-        digest_runs = storage.list_digest_runs(limit=max(40, per_kind * 5))
-        unread_digests = [r for r in digest_runs if bool(r.get("unread"))]
+    with storage.connection_scope():
+        alerts = storage.get_alerts(limit=per_kind * 3, unseen_only=True) if "alert" in selected_set else []
+        followups = storage.list_follow_ups(due_only=True, limit=per_kind * 3) if "follow_up" in selected_set else []
+        unread_digests: List[Dict[str, Any]] = []
+        if "digest" in selected_set:
+            digest_runs = storage.list_digest_runs(limit=max(40, per_kind * 5), include_items=False)
+            unread_digests = [r for r in digest_runs if bool(r.get("unread"))]
 
     items: List[Dict[str, Any]] = []
     for a in alerts:
@@ -1834,11 +2112,19 @@ def _build_unified_inbox_payload(
             }
         )
 
+    now_dt = datetime.now()
     for item in items:
-        priority_score, priority_reason = _priority_for_unified_inbox_item(item)
+        item_time = _resolve_inbox_item_time(item)
+        epoch = 0.0
+        if item_time:
+            try:
+                epoch = float(item_time.timestamp())
+            except Exception:
+                epoch = 0.0
+        item["_sort_epoch"] = epoch
+        priority_score, priority_reason = _priority_for_unified_inbox_item(item, now=now_dt, time_ref=item_time)
         item["_priority_score"] = int(priority_score)
         item["_priority_reason"] = str(priority_reason or "")
-        item["_sort_epoch"] = _inbox_sort_epoch(item)
 
     if sort_mode == "priority":
         items.sort(
@@ -1924,6 +2210,7 @@ def _attach_reading_meta(papers: List[Dict[str, Any]]) -> None:
     reading_map = storage.get_reading_status_map(ids)
     notes_map = storage.get_notes_meta_map(ids)
     reading_time_map = storage.get_reading_time_map(ids)
+    assignment_map = storage.get_assignment_meta_map(ids)
     for p in papers:
         pid = p.get("id")
         if not pid:
@@ -1943,6 +2230,10 @@ def _attach_reading_meta(papers: List[Dict[str, Any]]) -> None:
             p["reading_time_minutes"] = rt.get("minutes")
             p["reading_time_pages"] = rt.get("page_count")
             p["reading_time_updated_at"] = rt.get("updated_at")
+        assign_meta = assignment_map.get(pid) or {}
+        p["assignment_open_count"] = int(assign_meta.get("open_count") or 0)
+        p["assignment_unread_count"] = int(assign_meta.get("unread_count") or 0)
+        p["assignment_assignees"] = list(assign_meta.get("assignees") or [])
 
 def _attach_labels(papers: List[Dict[str, Any]]) -> None:
     if not papers:
@@ -2156,13 +2447,23 @@ def _estimate_reading_minutes_from_summary(paper: Dict[str, Any]) -> int:
 def _build_reading_plan_payload(
     total_minutes: int = 60,
     max_items: int = 6,
+    budget_mode: str = "balanced",
     include_new: bool = True,
     include_liked: bool = True,
     include_bookmarked: bool = True,
 ) -> Dict[str, Any]:
     storage.init_db()
+    mode = str(budget_mode or "balanced").strip().lower()
+    if mode not in {"balanced", "focus", "sprint", "deep"}:
+        mode = "balanced"
     budget = max(10, min(int(total_minutes or 60), 360))
     item_cap = max(1, min(int(max_items or 6), 20))
+    if mode == "deep":
+        item_cap = min(item_cap, 5)
+    elif mode == "focus":
+        item_cap = min(item_cap, 6)
+    elif mode == "sprint":
+        item_cap = min(item_cap, 8)
 
     candidates: Dict[str, Dict[str, Any]] = {}
     sources_by_id: Dict[str, set[str]] = {}
@@ -2188,6 +2489,7 @@ def _build_reading_plan_payload(
             limit=300,
             offset=0,
             dedupe_latest=True,
+            include_total=False,
         )
         add_candidates(new_rows, "new")
 
@@ -2197,6 +2499,7 @@ def _build_reading_plan_payload(
             "generated_at": datetime.now().isoformat(),
             "total_minutes_budget": budget,
             "max_items": item_cap,
+            "budget_mode": mode,
             "planned_minutes": 0,
             "items": [],
             "count": 0,
@@ -2242,6 +2545,21 @@ def _build_reading_plan_payload(
         score += min(2.0, math.log1p(float(paper.get("citation_count") or 0.0)) / 2.0)
         score += min(2.0, 0.2 * float(_paper_match_score(paper)))
         score += min(1.5, float(paper.get("novelty_score") or 0.0) * 1.5)
+        if mode == "sprint":
+            # Favor high-value short reads for tight sessions.
+            score += max(0.0, 2.4 - (float(minutes_remaining) / 28.0))
+            if minutes_remaining > max(45, int(budget * 0.75)):
+                score -= 1.0
+        elif mode == "focus":
+            if status in {"reading", "in_progress"}:
+                score += 2.0
+            if 0 < progress < 100:
+                score += 1.5
+        elif mode == "deep":
+            # Favor richer/longer papers and deprioritize low-signal quick reads.
+            score += min(2.0, float(minutes_remaining) / 35.0)
+            if minutes_remaining < 20:
+                score -= 0.75
 
         scored.append({
             "id": pid,
@@ -2266,6 +2584,8 @@ def _build_reading_plan_payload(
         mins = int(row.get("minutes_remaining") or 0)
         if mins <= 0:
             continue
+        if mode == "sprint" and plan_items and mins > max(35, int(budget * 0.6)):
+            continue
         # Always include first item; then try to stay within budget.
         if plan_items and (planned_minutes + mins) > budget:
             continue
@@ -2277,6 +2597,7 @@ def _build_reading_plan_payload(
         "generated_at": datetime.now().isoformat(),
         "total_minutes_budget": budget,
         "max_items": item_cap,
+        "budget_mode": mode,
         "planned_minutes": planned_minutes,
         "deferred_count": deferred_count,
         "items": plan_items,
@@ -2287,15 +2608,17 @@ def _build_reading_plan_payload(
 def _reading_plan_cache_key(
     total_minutes: int = 60,
     max_items: int = 6,
+    budget_mode: str = "balanced",
     include_new: bool = True,
     include_liked: bool = True,
     include_bookmarked: bool = True,
     day: Optional[str] = None,
 ) -> str:
     day_key = day or datetime.now().date().isoformat()
+    mode = str(budget_mode or "balanced").strip().lower()
     return (
         f"reading_plan:{day_key}:"
-        f"{int(total_minutes)}:{int(max_items)}:"
+        f"{int(total_minutes)}:{int(max_items)}:{mode}:"
         f"{int(bool(include_new))}:{int(bool(include_liked))}:{int(bool(include_bookmarked))}"
     )
 
@@ -2303,15 +2626,20 @@ def _reading_plan_cache_key(
 def _sanitize_reading_plan_options(
     total_minutes: Optional[int] = 60,
     max_items: Optional[int] = 6,
+    budget_mode: Optional[str] = "balanced",
     include_new: Optional[bool] = True,
     include_liked: Optional[bool] = True,
     include_bookmarked: Optional[bool] = True,
 ) -> Dict[str, Any]:
     budget = max(10, min(int(total_minutes or 60), 360))
     item_cap = max(1, min(int(max_items or 6), 20))
+    mode = str(budget_mode or "balanced").strip().lower()
+    if mode not in {"balanced", "focus", "sprint", "deep"}:
+        mode = "balanced"
     return {
         "total_minutes": budget,
         "max_items": item_cap,
+        "budget_mode": mode,
         "include_new": bool(include_new),
         "include_liked": bool(include_liked),
         "include_bookmarked": bool(include_bookmarked),
@@ -2332,6 +2660,7 @@ def _load_last_reading_plan_options() -> Dict[str, Any]:
     return _sanitize_reading_plan_options(
         total_minutes=parsed.get("total_minutes"),
         max_items=parsed.get("max_items"),
+        budget_mode=parsed.get("budget_mode"),
         include_new=parsed.get("include_new"),
         include_liked=parsed.get("include_liked"),
         include_bookmarked=parsed.get("include_bookmarked"),
@@ -2367,6 +2696,7 @@ def _refresh_today_reading_plan_cache(source: str = "auto") -> Dict[str, Any]:
     payload = _build_reading_plan_payload(
         total_minutes=options.get("total_minutes"),
         max_items=options.get("max_items"),
+        budget_mode=options.get("budget_mode"),
         include_new=options.get("include_new"),
         include_liked=options.get("include_liked"),
         include_bookmarked=options.get("include_bookmarked"),
@@ -2376,6 +2706,7 @@ def _refresh_today_reading_plan_cache(source: str = "auto") -> Dict[str, Any]:
     cache_key = _reading_plan_cache_key(
         total_minutes=options.get("total_minutes"),
         max_items=options.get("max_items"),
+        budget_mode=options.get("budget_mode"),
         include_new=options.get("include_new"),
         include_liked=options.get("include_liked"),
         include_bookmarked=options.get("include_bookmarked"),
@@ -2609,6 +2940,34 @@ def _normalize_rule_scope(scope: Optional[str]) -> str:
     value = str(scope or "").strip().lower()
     return value if value in {"papers", "inbox", "all"} else "papers"
 
+
+def _rule_min_novelty(rule: Dict[str, Any]) -> float:
+    try:
+        value = float(rule.get("min_novelty") or 0.0)
+    except Exception:
+        value = 0.0
+    return max(0.0, min(1.0, value))
+
+
+def _rule_is_in_quiet_hours(rule: Dict[str, Any], now_dt: Optional[datetime] = None) -> bool:
+    try:
+        start = int(rule.get("quiet_hours_start"))
+    except Exception:
+        start = -1
+    try:
+        end = int(rule.get("quiet_hours_end"))
+    except Exception:
+        end = -1
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        return False
+    hour = int((now_dt or datetime.now()).hour)
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    # wrap-around window, e.g., 22 -> 7
+    return hour >= start or hour < end
+
 def _rule_matches(rule: Dict[str, Any], paper: Dict[str, Any]) -> bool:
     if not rule or not paper:
         return False
@@ -2634,9 +2993,21 @@ def _rule_matches(rule: Dict[str, Any], paper: Dict[str, Any]) -> bool:
         return False
     if venues and not any(v in categories_text for v in venues):
         return False
+    min_novelty = _rule_min_novelty(rule)
+    if min_novelty > 0:
+        try:
+            novelty = float(paper.get("novelty_score"))
+        except Exception:
+            novelty = -1.0
+        if novelty < min_novelty:
+            return False
     return True
 
-def _rule_matches_inbox_item(rule: Dict[str, Any], item: Dict[str, Any]) -> bool:
+def _rule_matches_inbox_item(
+    rule: Dict[str, Any],
+    item: Dict[str, Any],
+    novelty_value: Optional[float] = None,
+) -> bool:
     if not rule or not item:
         return False
     target_kind = _normalize_inbox_kind(rule.get("target_kind"))
@@ -2671,6 +3042,14 @@ def _rule_matches_inbox_item(rule: Dict[str, Any], item: Dict[str, Any]) -> bool
         return False
     if venues and not any(venue in text for venue in venues):
         return False
+    min_novelty = _rule_min_novelty(rule)
+    if min_novelty > 0:
+        try:
+            nov = float(novelty_value if novelty_value is not None else item.get("novelty_score"))
+        except Exception:
+            nov = -1.0
+        if nov < min_novelty:
+            return False
     return True
 
 def _apply_inbox_rules_to_papers(
@@ -2706,6 +3085,7 @@ def _apply_inbox_rules_to_papers(
     audit_rows: List[Dict[str, Any]] = []
     pending_interactions: List[tuple[str, str]] = []
     pending_labels: List[tuple[str, str, str]] = []
+    now_dt = datetime.now()
 
     for p in papers:
         pid = p.get("id")
@@ -2718,6 +3098,32 @@ def _apply_inbox_rules_to_papers(
             matched += 1
             action = str(rule.get("action") or "label").lower()
             result = "matched"
+            if _rule_is_in_quiet_hours(rule, now_dt):
+                result = "quiet_hours"
+                match_item = {
+                    "scope": "papers",
+                    "rule_id": rule.get("id"),
+                    "rule_name": rule.get("name"),
+                    "action": action,
+                    "paper_id": pid,
+                    "title": p.get("title") or pid,
+                    "result": result,
+                }
+                if len(matches) < preview_cap:
+                    matches.append(match_item)
+                audit_rows.append(
+                    {
+                        "rule_id": rule.get("id"),
+                        "scope": "papers",
+                        "target_kind": None,
+                        "action": action,
+                        "item_ref": str(pid),
+                        "item_kind": "paper",
+                        "result": result,
+                        "meta": {"title": p.get("title"), "dry_run": bool(dry_run)},
+                    }
+                )
+                break
             if action == "dismiss":
                 if status == "new":
                     if not dry_run:
@@ -2828,18 +3234,36 @@ def _apply_inbox_rules_to_unified_items(
             "matches": [],
         }
 
+    novelty_by_pid: Dict[str, float] = {}
+    if any(_rule_min_novelty(r) > 0 for r in active_rules):
+        paper_ids = sorted({str(it.get("paper_id") or "") for it in items if it.get("paper_id")})
+        if paper_ids:
+            for row in storage.get_papers_by_ids(paper_ids):
+                pid = str(row.get("id") or "")
+                if not pid:
+                    continue
+                try:
+                    novelty_by_pid[pid] = float(row.get("novelty_score"))
+                except Exception:
+                    novelty_by_pid[pid] = -1.0
+
     matched = 0
     applied = 0
     preview_cap = max(10, min(int(limit or 200), 1000))
     matches: List[Dict[str, Any]] = []
     audit_rows: List[Dict[str, Any]] = []
+    now_dt = datetime.now()
 
     for item in items:
         item_kind = _normalize_inbox_kind(item.get("kind"))
         if not item_kind:
             continue
         for rule in active_rules:
-            if not _rule_matches_inbox_item(rule, item):
+            pid = str(item.get("paper_id") or "")
+            novelty_value = None
+            if pid and pid in novelty_by_pid:
+                novelty_value = novelty_by_pid.get(pid)
+            if not _rule_matches_inbox_item(rule, item, novelty_value=novelty_value):
                 continue
             matched += 1
             action = str(rule.get("action") or "").strip().lower() or _default_inbox_action_for_kind(item_kind)
@@ -2857,7 +3281,9 @@ def _apply_inbox_rules_to_unified_items(
             item_ref = str(item.get("id") or item.get("alert_id") or item.get("follow_id") or item.get("digest_id") or "")
             result = "matched"
             error = None
-            if dry_run:
+            if _rule_is_in_quiet_hours(rule, now_dt):
+                result = "quiet_hours"
+            elif dry_run:
                 result = "would_apply"
             else:
                 try:
@@ -2932,17 +3358,18 @@ def _run_inbox_rules(scope: str = "papers", dry_run: bool = False, limit: int = 
         page_offset = 0
         while len(papers) < paper_cap:
             page_limit = min(400, paper_cap - len(papers))
-            page_rows, page_total = storage.get_papers_page_by_status(
+            page_rows, _ = storage.get_papers_page_by_status(
                 status="new",
                 limit=page_limit,
                 offset=page_offset,
                 dedupe_latest=True,
+                include_total=False,
             )
             if not page_rows:
                 break
             papers.extend(page_rows)
             page_offset += len(page_rows)
-            if page_offset >= int(page_total or 0):
+            if len(page_rows) < page_limit:
                 break
         paper_result = _apply_inbox_rules_to_papers(
             papers,
@@ -3024,8 +3451,17 @@ def _build_inbox_rule_diagnostics(limit: int = 200) -> Dict[str, Any]:
         scope = _normalize_rule_scope(rule.get("scope"))
         target_kind = _normalize_inbox_kind(rule.get("target_kind"))
         snooze_days = max(1, min(90, int(rule.get("snooze_days") or 3)))
+        min_novelty = _rule_min_novelty(rule)
+        try:
+            quiet_start = int(rule.get("quiet_hours_start") if rule.get("quiet_hours_start") is not None else -1)
+        except Exception:
+            quiet_start = -1
+        try:
+            quiet_end = int(rule.get("quiet_hours_end") if rule.get("quiet_hours_end") is not None else -1)
+        except Exception:
+            quiet_end = -1
         label = str(rule.get("label") or "").strip()
-        condition_count = len(keywords) + len(authors) + len(venues)
+        condition_count = len(keywords) + len(authors) + len(venues) + (1 if min_novelty > 0 else 0)
 
         if enabled and condition_count == 0:
             _add_diag(
@@ -3063,6 +3499,23 @@ def _build_inbox_rule_diagnostics(limit: int = 200) -> Dict[str, Any]:
                 rule=rule,
                 extra={"snooze_days": snooze_days},
             )
+        quiet_ok = (0 <= quiet_start <= 23 and 0 <= quiet_end <= 23 and quiet_start != quiet_end)
+        if enabled and ((quiet_start >= 0 or quiet_end >= 0) and not quiet_ok):
+            _add_diag(
+                "quiet_hours_invalid",
+                "warn",
+                "Quiet-hours window is invalid. Use two different hours in 0-23.",
+                rule=rule,
+                extra={"quiet_hours_start": quiet_start, "quiet_hours_end": quiet_end},
+            )
+        if enabled and quiet_ok:
+            _add_diag(
+                "quiet_hours_enabled",
+                "info",
+                "Rule quiet-hours window is enabled.",
+                rule=rule,
+                extra={"quiet_hours_start": quiet_start, "quiet_hours_end": quiet_end},
+            )
 
         signature = "|".join(
             [
@@ -3071,6 +3524,9 @@ def _build_inbox_rule_diagnostics(limit: int = 200) -> Dict[str, Any]:
                 action,
                 label.lower(),
                 str(snooze_days),
+                f"{min_novelty:.3f}",
+                str(quiet_start),
+                str(quiet_end),
                 ",".join(sorted(keywords)),
                 ",".join(sorted(authors)),
                 ",".join(sorted(venues)),
@@ -3082,6 +3538,7 @@ def _build_inbox_rule_diagnostics(limit: int = 200) -> Dict[str, Any]:
             [
                 scope,
                 target_kind or "*",
+                f"{min_novelty:.3f}",
                 ",".join(sorted(keywords)),
                 ",".join(sorted(authors)),
                 ",".join(sorted(venues)),
@@ -3319,20 +3776,18 @@ def _api_cache_get(key: str, ttl_seconds: int, epoch_key: str) -> Optional[Any]:
         if ttl_seconds is not None and (now_ts - created_at) > ttl_seconds:
             return None
         payload = entry.get("payload")
-    try:
-        return copy.deepcopy(payload)
-    except Exception:
-        return payload
+    if isinstance(payload, (dict, list)):
+        try:
+            return copy.deepcopy(payload)
+        except Exception:
+            return payload
+    return payload
 
 def _api_cache_set(key: str, payload: Any, epoch_key: str) -> None:
     now_ts = datetime.now().timestamp()
-    try:
-        cached = copy.deepcopy(payload)
-    except Exception:
-        cached = payload
     with _API_CACHE_LOCK:
         _API_CACHE[key] = {
-            "payload": cached,
+            "payload": payload,
             "created_at_ts": now_ts,
             "epoch": _API_CACHE_EPOCHS.get(epoch_key, 0),
         }
@@ -3737,9 +4192,54 @@ def _run_saved_search_agent(agent: Dict, trigger: str = "manual") -> Dict:
         _ACTIVE_SEARCH_RUNS.add(agent_id)
 
     try:
-        query = agent.get("query", "")
+        query = str(agent.get("query") or "").strip()
+        mode = str(agent.get("mode") or "global").strip().lower() or "global"
+        if mode not in {"global", "semantic", "local"}:
+            mode = "global"
+        source_paper_id = str(agent.get("source_paper_id") or "").strip() or None
         max_results = max(1, int(agent.get("max_results") or 8))
-        papers = client.search_archive(query, max_results=max_results)
+        papers: List[Dict[str, Any]] = []
+        query_used = query
+
+        if mode == "semantic":
+            seed_text = query
+            if source_paper_id:
+                seed_paper = _resolve_paper_by_id(source_paper_id)
+                if seed_paper:
+                    seed_text = f"{seed_paper.get('title', '')}. {seed_paper.get('summary', '')}".strip() or seed_text
+                    source_paper_id = seed_paper.get("id")
+            query_vec = embeddings.generate_embedding(seed_text)
+            query_used = f"semantic:{seed_text[:160]}"
+            if query_vec.size > 0:
+                scored = storage.search_semantic(query_vec, limit=max(20, max_results * 6))
+                score_map = {str(r.get("id") or ""): float(r.get("score") or 0.0) for r in scored if r.get("id")}
+                ids = [pid for pid in score_map.keys()]
+                fetched = storage.get_papers_by_ids(ids)
+                by_id = {p.get("id"): p for p in fetched if p.get("id")}
+                ordered: List[Dict[str, Any]] = []
+                for pid in ids:
+                    paper = by_id.get(pid)
+                    if not paper:
+                        continue
+                    paper = dict(paper)
+                    paper["semantic_score"] = round(float(score_map.get(pid) or 0.0), 4)
+                    ordered.append(paper)
+                    if len(ordered) >= max_results:
+                        break
+                papers = ordered
+        elif mode == "local":
+            matches, _total = storage.search_full_text_paged(query, limit=max_results, offset=0)
+            ids = [str(m.get("id") or "") for m in matches if m.get("id")]
+            papers = storage.get_papers_by_ids(ids) if ids else []
+            by_id = {p.get("id"): p for p in papers if p.get("id")}
+            ordered: List[Dict[str, Any]] = []
+            for pid in ids:
+                paper = by_id.get(pid)
+                if paper:
+                    ordered.append(paper)
+            papers = ordered
+        else:
+            papers = client.search_archive(query, max_results=max_results)
 
         paper_ids = [p.get("id") for p in papers if p.get("id")]
         seen_ids = storage.get_saved_search_seen_ids(agent_id, paper_ids)
@@ -3747,16 +4247,19 @@ def _run_saved_search_agent(agent: Dict, trigger: str = "manual") -> Dict:
 
         # Persist all matched ids as seen to suppress repeated noise next runs.
         storage.mark_saved_search_seen(agent_id, paper_ids)
-        storage.save_papers(papers)
+        if mode == "global":
+            storage.save_papers(papers)
         created_alerts = generate_alerts_for_papers(new_papers)
 
-        summary = ai_service.summarize_saved_search_results(agent.get("name", "Agent"), query, new_papers)
+        summary = ai_service.summarize_saved_search_results(agent.get("name", "Agent"), query_used, new_papers)
         storage.record_saved_search_run(agent_id, summary, len(new_papers))
 
         return {
             "agent_id": agent_id,
             "name": agent.get("name"),
-            "query": query,
+            "query": query_used,
+            "mode": mode,
+            "source_paper_id": source_paper_id,
             "trigger": trigger,
             "matches": len(papers),
             "new_matches": len(new_papers),
@@ -4653,7 +5156,8 @@ def get_papers(
     weights = _parse_rank_weights(w_relevance, w_novelty, w_citations)
     use_profile = (sort_mode == 'profile') or (sort_mode in {'smart', 'profile'} and any(v is not None for v in [w_relevance, w_novelty, w_citations]))
     use_smart = (sort_mode == 'smart' and not use_profile)
-    raw_bookmarked_ids = set(storage.get_bookmarked_ids())
+    with storage.connection_scope():
+        raw_bookmarked_ids = set(storage.get_bookmarked_ids())
     bookmarked_ids = set(raw_bookmarked_ids)
     for bid in raw_bookmarked_ids:
         sid = str(bid or "")
@@ -4663,32 +5167,157 @@ def get_papers(
     # Fast SQL-paged path for recency-sorted feeds.
     # This avoids loading and version-deduping large datasets on every offset.
     if include_meta and not use_smart and not use_profile and sort_mode in {'', 'date'} and status in {'new', 'dismissed', 'read', 'bookmarked'}:
-        published_date_filter = None
-        if date and status == 'new':
-            d = datetime.strptime(date, "%Y-%m-%d").date()
-            published_date_filter = (d - timedelta(days=1)).isoformat()
-        if status == "bookmarked":
-            result, total = storage.get_bookmarked_papers_page(
-                limit=limit,
-                offset=offset,
-                published_date=published_date_filter,
-                dedupe_latest=False,
-            )
-        else:
-            result, total = storage.get_papers_page_by_status(
-                status=status,
-                limit=limit,
-                offset=offset,
-                published_date=published_date_filter,
-                dedupe_latest=(status == "new"),
-            )
+        with storage.connection_scope():
+            published_date_filter = None
+            if date and status == 'new':
+                d = datetime.strptime(date, "%Y-%m-%d").date()
+                published_date_filter = (d - timedelta(days=1)).isoformat()
+            if status == "bookmarked":
+                result, total = storage.get_bookmarked_papers_page(
+                    limit=limit,
+                    offset=offset,
+                    published_date=published_date_filter,
+                    dedupe_latest=False,
+                )
+            else:
+                result, total = storage.get_papers_page_by_status(
+                    status=status,
+                    limit=limit,
+                    offset=offset,
+                    published_date=published_date_filter,
+                    dedupe_latest=(status == "new"),
+                )
 
-        for p in result:
-            pid = p.get('id')
-            p['bookmarked'] = (status == "bookmarked") or bool(pid and pid in bookmarked_ids)
-            p['score'] = _paper_match_score(p)
-        result = _attach_version_metadata(result, dedupe_latest=False if status == "bookmarked" else (status == "new"))
-        if include_novelty and result:
+            for p in result:
+                pid = p.get('id')
+                p['bookmarked'] = (status == "bookmarked") or bool(pid and pid in bookmarked_ids)
+                p['score'] = _paper_match_score(p)
+            result = _attach_version_metadata(result, dedupe_latest=False if status == "bookmarked" else (status == "new"))
+            if include_novelty and result:
+                missing_ids = [p["id"] for p in result if p.get("novelty_score") is None]
+                novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
+                if novelty_map:
+                    _enqueue_novelty_backfill(novelty_map)
+                for p in result:
+                    if p.get("novelty_score") is None:
+                        p["novelty_score"] = novelty_map.get(p["id"])
+
+            _attach_version_notes(result)
+            _attach_version_change_fields(result)
+            _attach_match_reasons(result)
+            _attach_reading_meta(result)
+            _attach_labels(result)
+            _attach_pins(result)
+            payload = {
+                "items": result,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": (offset + len(result)) < total,
+            }
+        _api_cache_set(cache_key, payload, epoch_key="papers")
+        return JSONResponse(content=payload, headers={"ETag": etag})
+
+    with storage.connection_scope():
+        # Check for bookmark queries
+        if status == 'bookmarked':
+            papers = storage.get_papers_by_ids(list(raw_bookmarked_ids))
+        else:
+            papers = storage.get_papers_by_status(status)
+
+            # Only filter 'new' papers by date.
+            # Favorites and Dismissed should show all history regardless of the date picker.
+            if date and status == 'new':
+                # Shift date back by 1 day for filtering
+                d = datetime.strptime(date, "%Y-%m-%d").date()
+                query_d = d - timedelta(days=1)
+                filter_str = query_d.isoformat()
+
+                papers = [p for p in papers if p['published'].startswith(filter_str)]
+
+        # Inject bookmark status into every paper
+        for p in papers:
+            p['bookmarked'] = (p['id'] in bookmarked_ids)
+
+        dedupe_versions = (status == 'new')
+        papers = _attach_version_metadata(papers, dedupe_latest=dedupe_versions)
+        pin_map = {}
+        if status == 'liked':
+            pin_map = _attach_pins(papers)
+
+        rank_cache_key = None
+        rank_cache_ids: Optional[List[str]] = None
+        if include_meta and (use_profile or use_smart):
+            rank_cache_key = (
+                f"papers_rank:{status}:{date or ''}:{sort_mode}:"
+                f"{weights.get('relevance', 0.0):.4f}:{weights.get('novelty', 0.0):.4f}:{weights.get('citations', 0.0):.4f}"
+            )
+            rank_cache_ids = _get_paged_rank_cache(rank_cache_key, "papers")
+
+        computed_novelty = False
+        if status == 'liked' and sort_mode in {'date', 'matches', 'novelty'}:
+            ranked = list(papers)
+            if sort_mode == 'matches':
+                for p in ranked:
+                    p["match_score"] = _paper_match_score(p)
+                ranked.sort(key=lambda x: (x.get("match_score", 0), x.get("published", "")), reverse=True)
+            elif sort_mode == 'novelty':
+                missing_ids = [p["id"] for p in ranked if p.get("novelty_score") is None]
+                novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
+                if novelty_map:
+                    _enqueue_novelty_backfill(novelty_map)
+                for p in ranked:
+                    if p.get("novelty_score") is None:
+                        p["novelty_score"] = novelty_map.get(p["id"])
+                ranked.sort(key=lambda x: (x.get("novelty_score") or 0), reverse=True)
+                computed_novelty = True
+            else:
+                ranked.sort(key=lambda x: x.get("published", ""), reverse=True)
+            if pin_map:
+                ranked = _apply_pin_order(ranked, pin_map)
+            total = len(ranked)
+            result = ranked[offset: offset + limit]
+        elif use_profile:
+            used_cache = False
+            if rank_cache_ids:
+                paper_map = {p.get("id"): p for p in papers if p.get("id")}
+                ranked = [paper_map[pid] for pid in rank_cache_ids if pid in paper_map]
+                used_cache = True
+            else:
+                ranked = _apply_profile_sort(papers, weights)
+                if rank_cache_key:
+                    _set_paged_rank_cache(rank_cache_key, [p.get("id") for p in ranked if p.get("id")], "papers")
+            if pin_map and status == 'liked' and not used_cache:
+                ranked = _apply_pin_order(ranked, pin_map)
+            total = len(ranked)
+            result = ranked[offset: offset + limit]
+            computed_novelty = True
+        else:
+            # Fast path for paged feeds: keep ordering by recency and avoid re-ranking the full set on each page.
+            if include_meta and not use_smart:
+                ranked = sorted(papers, key=lambda x: x.get("published", ""), reverse=True)
+                if pin_map and status == 'liked':
+                    ranked = _apply_pin_order(ranked, pin_map)
+                total = len(ranked)
+                result = ranked[offset: offset + limit]
+                for p in result:
+                    p["score"] = _paper_match_score(p)
+            else:
+                used_cache = False
+                if use_smart and rank_cache_ids:
+                    paper_map = {p.get("id"): p for p in papers if p.get("id")}
+                    ranked = [paper_map[pid] for pid in rank_cache_ids if pid in paper_map]
+                    used_cache = True
+                else:
+                    ranked = ranker.rank_papers(papers, use_smart_rank=use_smart)
+                    if use_smart and rank_cache_key:
+                        _set_paged_rank_cache(rank_cache_key, [p.get("id") for p in ranked if p.get("id")], "papers")
+                if pin_map and status == 'liked' and not used_cache:
+                    ranked = _apply_pin_order(ranked, pin_map)
+                total = len(ranked)
+                result = ranked[offset: offset + limit]
+
+        if include_novelty and result and not computed_novelty:
             missing_ids = [p["id"] for p in result if p.get("novelty_score") is None]
             novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
             if novelty_map:
@@ -4703,129 +5332,6 @@ def get_papers(
         _attach_reading_meta(result)
         _attach_labels(result)
         _attach_pins(result)
-        payload = {
-            "items": result,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "has_more": (offset + len(result)) < total,
-        }
-        _api_cache_set(cache_key, payload, epoch_key="papers")
-        return JSONResponse(content=payload, headers={"ETag": etag})
-
-    # Check for bookmark queries
-    if status == 'bookmarked':
-        papers = storage.get_papers_by_ids(list(raw_bookmarked_ids))
-    else:
-        papers = storage.get_papers_by_status(status)
-        
-        # Only filter 'new' papers by date.
-        # Favorites and Dismissed should show all history regardless of the date picker.
-        if date and status == 'new':
-            # Shift date back by 1 day for filtering
-            d = datetime.strptime(date, "%Y-%m-%d").date()
-            query_d = d - timedelta(days=1)
-            filter_str = query_d.isoformat()
-            
-            papers = [p for p in papers if p['published'].startswith(filter_str)]
-    
-    # Inject bookmark status into every paper
-    for p in papers:
-        p['bookmarked'] = (p['id'] in bookmarked_ids)
-
-    dedupe_versions = (status == 'new')
-    papers = _attach_version_metadata(papers, dedupe_latest=dedupe_versions)
-    pin_map = {}
-    if status == 'liked':
-        pin_map = _attach_pins(papers)
-
-    rank_cache_key = None
-    rank_cache_ids: Optional[List[str]] = None
-    if include_meta and (use_profile or use_smart):
-        rank_cache_key = (
-            f"papers_rank:{status}:{date or ''}:{sort_mode}:"
-            f"{weights.get('relevance', 0.0):.4f}:{weights.get('novelty', 0.0):.4f}:{weights.get('citations', 0.0):.4f}"
-        )
-        rank_cache_ids = _get_paged_rank_cache(rank_cache_key, "papers")
-
-    computed_novelty = False
-    if status == 'liked' and sort_mode in {'date', 'matches', 'novelty'}:
-        ranked = list(papers)
-        if sort_mode == 'matches':
-            for p in ranked:
-                p["match_score"] = _paper_match_score(p)
-            ranked.sort(key=lambda x: (x.get("match_score", 0), x.get("published", "")), reverse=True)
-        elif sort_mode == 'novelty':
-            missing_ids = [p["id"] for p in ranked if p.get("novelty_score") is None]
-            novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
-            if novelty_map:
-                _enqueue_novelty_backfill(novelty_map)
-            for p in ranked:
-                if p.get("novelty_score") is None:
-                    p["novelty_score"] = novelty_map.get(p["id"])
-            ranked.sort(key=lambda x: (x.get("novelty_score") or 0), reverse=True)
-            computed_novelty = True
-        else:
-            ranked.sort(key=lambda x: x.get("published", ""), reverse=True)
-        if pin_map:
-            ranked = _apply_pin_order(ranked, pin_map)
-        total = len(ranked)
-        result = ranked[offset: offset + limit]
-    elif use_profile:
-        used_cache = False
-        if rank_cache_ids:
-            paper_map = {p.get("id"): p for p in papers if p.get("id")}
-            ranked = [paper_map[pid] for pid in rank_cache_ids if pid in paper_map]
-            used_cache = True
-        else:
-            ranked = _apply_profile_sort(papers, weights)
-            if rank_cache_key:
-                _set_paged_rank_cache(rank_cache_key, [p.get("id") for p in ranked if p.get("id")], "papers")
-        if pin_map and status == 'liked' and not used_cache:
-            ranked = _apply_pin_order(ranked, pin_map)
-        total = len(ranked)
-        result = ranked[offset: offset + limit]
-        computed_novelty = True
-    else:
-        # Fast path for paged feeds: keep ordering by recency and avoid re-ranking the full set on each page.
-        if include_meta and not use_smart:
-            ranked = sorted(papers, key=lambda x: x.get("published", ""), reverse=True)
-            if pin_map and status == 'liked':
-                ranked = _apply_pin_order(ranked, pin_map)
-            total = len(ranked)
-            result = ranked[offset: offset + limit]
-            for p in result:
-                p["score"] = _paper_match_score(p)
-        else:
-            used_cache = False
-            if use_smart and rank_cache_ids:
-                paper_map = {p.get("id"): p for p in papers if p.get("id")}
-                ranked = [paper_map[pid] for pid in rank_cache_ids if pid in paper_map]
-                used_cache = True
-            else:
-                ranked = ranker.rank_papers(papers, use_smart_rank=use_smart)
-                if use_smart and rank_cache_key:
-                    _set_paged_rank_cache(rank_cache_key, [p.get("id") for p in ranked if p.get("id")], "papers")
-            if pin_map and status == 'liked' and not used_cache:
-                ranked = _apply_pin_order(ranked, pin_map)
-            total = len(ranked)
-            result = ranked[offset: offset + limit]
-
-    if include_novelty and result and not computed_novelty:
-        missing_ids = [p["id"] for p in result if p.get("novelty_score") is None]
-        novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
-        if novelty_map:
-            _enqueue_novelty_backfill(novelty_map)
-        for p in result:
-            if p.get("novelty_score") is None:
-                p["novelty_score"] = novelty_map.get(p["id"])
-
-    _attach_version_notes(result)
-    _attach_version_change_fields(result)
-    _attach_match_reasons(result)
-    _attach_reading_meta(result)
-    _attach_labels(result)
-    _attach_pins(result)
 
     if include_meta:
         payload = {
@@ -5029,15 +5535,29 @@ def create_saved_search_agent(req: SavedSearchRequest):
     cadence = (req.cadence or "daily").lower()
     if cadence not in {"daily", "weekly"}:
         raise HTTPException(status_code=400, detail="Cadence must be 'daily' or 'weekly'.")
+    mode = (req.mode or "global").strip().lower()
+    if mode not in {"global", "semantic", "local"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: global, semantic, local")
     name = (req.name or "").strip()
     query = (req.query or "").strip()
-    if not name or not query:
-        raise HTTPException(status_code=400, detail="Both name and query are required.")
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required.")
+    if mode != "semantic" and not query:
+        raise HTTPException(status_code=400, detail="query is required for local/global modes.")
+    source_paper_id = None
+    if req.source_paper_id:
+        paper = _resolve_paper_by_id(req.source_paper_id)
+        if not paper and mode == "semantic":
+            raise HTTPException(status_code=404, detail="source_paper_id not found")
+        if paper:
+            source_paper_id = paper.get("id")
     agent_id = storage.create_saved_search_agent(
         name=name,
         query=query,
         cadence=cadence,
         max_results=max(1, int(req.max_results)),
+        mode=mode,
+        source_paper_id=source_paper_id,
     )
     return {"id": agent_id}
 
@@ -5175,90 +5695,84 @@ def share_view(req: ViewShareRequest):
             if page_limit <= 0:
                 break
             if status == "bookmarked":
-                page_rows, page_total = storage.get_bookmarked_papers_page(
+                page_rows, _ = storage.get_bookmarked_papers_page(
                     limit=page_limit,
                     offset=page_offset,
                     published_date=published_date_filter,
                     dedupe_latest=False,
+                    query_text=query or None,
+                    include_total=False,
                 )
             else:
-                page_rows, page_total = storage.get_papers_page_by_status(
+                page_rows, _ = storage.get_papers_page_by_status(
                     status=status,
                     limit=page_limit,
                     offset=page_offset,
                     published_date=published_date_filter,
                     dedupe_latest=(status == "new"),
+                    query_text=query or None,
+                    include_total=False,
                 )
             if not page_rows:
                 break
             rows.extend(page_rows)
             page_offset += len(page_rows)
-            if page_offset >= int(page_total or 0):
+            if len(page_rows) < page_limit:
                 break
         return rows
 
-    if status == "liked":
-        papers = storage.get_papers_by_status("liked")
-    else:
-        if not query and not use_profile and sort_mode in {"", "date"}:
-            scan_cap = limit
+    with storage.connection_scope():
+        if status == "liked" and not query:
+            papers = storage.get_papers_by_status("liked")
         else:
-            scan_cap = max(600, min(5000, limit * 12))
-            if query:
-                scan_cap = max(scan_cap, min(5000, limit * 20))
-        papers = _load_share_candidates(scan_cap)
+            if not query and not use_profile and sort_mode in {"", "date"}:
+                scan_cap = limit
+            else:
+                scan_cap = max(600, min(5000, limit * 12))
+                if query:
+                    scan_cap = max(scan_cap, min(5000, limit * 20))
+            papers = _load_share_candidates(scan_cap)
 
-    if query:
-        def _matches(p):
-            title = str(p.get("title") or "")
-            summary = str(p.get("summary") or "")
-            authors = p.get("authors") or []
-            if isinstance(authors, str):
-                authors = [authors]
-            text = f"{title} {summary} {' '.join(authors)}".lower()
-            return query in text
-        papers = [p for p in papers if _matches(p)]
+        pin_map = _attach_pins(papers) if status == "liked" else {}
 
-    pin_map = _attach_pins(papers) if status == "liked" else {}
-
-    if status == "liked" and sort_mode in {"date", "matches", "novelty"}:
-        ranked = list(papers)
-        if sort_mode == "matches":
-            for p in ranked:
-                p["match_score"] = _paper_match_score(p)
-            ranked.sort(key=lambda x: (x.get("match_score", 0), x.get("published", "")), reverse=True)
-        elif sort_mode == "novelty":
-            missing_ids = [p["id"] for p in ranked if p.get("novelty_score") is None]
-            novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
-            if novelty_map:
-                _enqueue_novelty_backfill(novelty_map)
-            for p in ranked:
-                if p.get("novelty_score") is None:
-                    p["novelty_score"] = novelty_map.get(p["id"])
-            ranked.sort(key=lambda x: (x.get("novelty_score") or 0), reverse=True)
+        if status == "liked" and sort_mode in {"date", "matches", "novelty"}:
+            ranked = list(papers)
+            if sort_mode == "matches":
+                for p in ranked:
+                    p["match_score"] = _paper_match_score(p)
+                ranked.sort(key=lambda x: (x.get("match_score", 0), x.get("published", "")), reverse=True)
+            elif sort_mode == "novelty":
+                missing_ids = [p["id"] for p in ranked if p.get("novelty_score") is None]
+                novelty_map = storage.compute_novelty_scores(missing_ids, reference_status="liked") if missing_ids else {}
+                if novelty_map:
+                    _enqueue_novelty_backfill(novelty_map)
+                for p in ranked:
+                    if p.get("novelty_score") is None:
+                        p["novelty_score"] = novelty_map.get(p["id"])
+                ranked.sort(key=lambda x: (x.get("novelty_score") or 0), reverse=True)
+            else:
+                ranked.sort(key=lambda x: x.get("published", ""), reverse=True)
+        elif use_profile:
+            ranked = _apply_profile_sort(papers, weights)
+        elif sort_mode == "smart":
+            ranked = ranker.rank_papers(papers, use_smart_rank=True)
         else:
-            ranked.sort(key=lambda x: x.get("published", ""), reverse=True)
-    elif use_profile:
-        ranked = _apply_profile_sort(papers, weights)
-    elif sort_mode == "smart":
-        ranked = ranker.rank_papers(papers, use_smart_rank=True)
-    else:
-        ranked = sorted(papers, key=lambda x: x.get("published", ""), reverse=True)
+            ranked = sorted(papers, key=lambda x: x.get("published", ""), reverse=True)
 
-    if pin_map:
-        ranked = _apply_pin_order(ranked, pin_map)
+        if pin_map:
+            ranked = _apply_pin_order(ranked, pin_map)
 
-    ids = [p.get("id") for p in ranked if p.get("id")][:limit]
-    meta_parts = [status]
-    if query:
-        meta_parts.append(f"query: {query[:60]}")
-    meta = " · ".join(meta_parts)
-    payload = {
-        "ids": ids,
-        "title": req.name or "Shared View",
-        "meta": meta,
-    }
-    token = storage.create_share_token("view", json.dumps(payload), ttl_days=SHARE_TOKEN_TTL_DAYS)
+        ids = [p.get("id") for p in ranked if p.get("id")][:limit]
+        meta_parts = [status]
+        if query:
+            meta_parts.append(f"query: {query[:60]}")
+        meta = " · ".join(meta_parts)
+        payload = {
+            "ids": ids,
+            "title": req.name or "Shared View",
+            "meta": meta,
+        }
+        token = storage.create_share_token("view", json.dumps(payload), ttl_days=SHARE_TOKEN_TTL_DAYS)
     return {"token": token, "count": len(ids)}
 
 @app.post("/api/weekly-picks/share")
@@ -5935,10 +6449,15 @@ def cancel_job(job_id: str):
 
 @app.post("/api/papers/{paper_id:path}/bookmark")
 def bookmark_paper(paper_id: str, req: BookmarkRequest):
+    storage.init_db()
+    paper = _resolve_paper_by_id(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    resolved_id = str(paper.get("id") or paper_id)
     if req.active:
-        storage.add_bookmark(paper_id)
+        storage.add_bookmark(resolved_id)
     else:
-        storage.remove_bookmark(paper_id)
+        storage.remove_bookmark(resolved_id)
     _bump_api_cache_epochs("papers")
     return {"success": True}
 
@@ -5947,12 +6466,17 @@ def rate_paper(paper_id: str, req: RateRequest, background_tasks: BackgroundTask
     print(f"DEBUG: Rate request for paper_id='{paper_id}' status='{req.status}'")
     if req.status not in ['liked', 'dismissed']:
         raise HTTPException(status_code=400, detail="Invalid status")
-    
-    storage.update_interaction(paper_id, req.status)
+    storage.init_db()
+    paper = _resolve_paper_by_id(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    resolved_id = str(paper.get("id") or paper_id)
+
+    storage.update_interaction(resolved_id, req.status)
     _bump_api_cache_epochs("papers", "graph")
     
     if req.status == 'liked':
-        background_tasks.add_task(downloader.download_pdf, paper_id)
+        background_tasks.add_task(downloader.download_pdf, resolved_id)
         background_tasks.add_task(background_retrain)
         
     return {"success": True}
@@ -6049,6 +6573,7 @@ def generate_reading_plan(req: ReadingPlanGenerateRequest):
     options = _sanitize_reading_plan_options(
         total_minutes=req.total_minutes,
         max_items=req.max_items,
+        budget_mode=req.budget_mode,
         include_new=req.include_new,
         include_liked=req.include_liked,
         include_bookmarked=req.include_bookmarked,
@@ -6057,6 +6582,7 @@ def generate_reading_plan(req: ReadingPlanGenerateRequest):
     cache_key = _reading_plan_cache_key(
         total_minutes=options.get("total_minutes"),
         max_items=options.get("max_items"),
+        budget_mode=options.get("budget_mode"),
         include_new=options.get("include_new"),
         include_liked=options.get("include_liked"),
         include_bookmarked=options.get("include_bookmarked"),
@@ -6076,6 +6602,7 @@ def generate_reading_plan(req: ReadingPlanGenerateRequest):
     payload = _build_reading_plan_payload(
         total_minutes=options.get("total_minutes"),
         max_items=options.get("max_items"),
+        budget_mode=options.get("budget_mode"),
         include_new=options.get("include_new"),
         include_liked=options.get("include_liked"),
         include_bookmarked=options.get("include_bookmarked"),
@@ -6094,6 +6621,7 @@ def get_today_reading_plan(refresh: bool = False):
     cache_key = _reading_plan_cache_key(
         total_minutes=options.get("total_minutes"),
         max_items=options.get("max_items"),
+        budget_mode=options.get("budget_mode"),
         include_new=options.get("include_new"),
         include_liked=options.get("include_liked"),
         include_bookmarked=options.get("include_bookmarked"),
@@ -6241,6 +6769,110 @@ def get_reading_plan_for_date(plan_date: str):
     payload["snapshot_created_at"] = snap.get("created_at")
     payload["snapshot_source"] = snap.get("source")
     return payload
+
+def _normalize_notes_templates(templates: Any) -> List[Dict[str, str]]:
+    if not isinstance(templates, list):
+        return copy.deepcopy(DEFAULT_NOTES_TEMPLATES)
+    out: List[Dict[str, str]] = []
+    for idx, row in enumerate(templates):
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        body = str(row.get("body") or "").strip()
+        if not name or not body:
+            continue
+        raw_id = str(row.get("id") or "").strip().lower()
+        if not raw_id:
+            raw_id = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if not raw_id:
+            raw_id = f"template-{idx + 1}"
+        out.append(
+            {
+                "id": raw_id[:64],
+                "name": name[:80],
+                "body": body[:8000],
+            }
+        )
+        if len(out) >= 24:
+            break
+    if not out:
+        return copy.deepcopy(DEFAULT_NOTES_TEMPLATES)
+    return out
+
+def _load_notes_templates() -> List[Dict[str, str]]:
+    raw = storage.get_ai_cache(NOTES_TEMPLATES_CACHE_KEY, max_age_seconds=365 * 24 * 3600)
+    if not raw:
+        return copy.deepcopy(DEFAULT_NOTES_TEMPLATES)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return copy.deepcopy(DEFAULT_NOTES_TEMPLATES)
+    return _normalize_notes_templates(parsed)
+
+def _build_notes_auto_summary_block(paper: Dict[str, Any], style: str = "concise") -> str:
+    style_clean = str(style or "concise").strip().lower()
+    if style_clean not in {"concise", "structured", "deep"}:
+        style_clean = "concise"
+    title = str(paper.get("title") or "").strip()
+    summary = str(paper.get("summary") or "").strip()
+    structure = ai_service.extract_paper_structure(paper)
+    prompt = (
+        "Create a Markdown notes block for this paper.\n"
+        f"Style: {style_clean}\n"
+        "Keep it factual and concise. Include: TL;DR, Method, Evidence, Caveats, and Next action.\n"
+        "Do not invent facts; explicitly write 'Not found in abstract' when missing.\n\n"
+        f"Title: {title}\n"
+        f"Abstract: {summary}\n"
+        f"Structure hints: {json.dumps(structure)}\n\n"
+        "Return only Markdown."
+    )
+    ai_text = (ai_service.query_ollama(prompt, "", timeout=120) or "").strip()
+    if ai_text:
+        return ai_text
+
+    def pick(field: str, default: str = "Not found in abstract."):
+        value = str((structure or {}).get(field) or "").strip()
+        return value or default
+
+    return (
+        f"## Auto Summary\n"
+        f"- **TL;DR:** {pick('problem')}\n\n"
+        f"### Method\n"
+        f"- {pick('method')}\n\n"
+        f"### Evidence\n"
+        f"- {pick('results')}\n\n"
+        f"### Caveats\n"
+        f"- {pick('limitations')}\n\n"
+        f"### Next Action\n"
+        f"- Verify dataset/setup details before reproducing results.\n"
+    )
+
+@app.get("/api/notes/templates")
+def list_notes_templates_endpoint():
+    storage.init_db()
+    templates = _load_notes_templates()
+    return {"count": len(templates), "templates": templates}
+
+@app.post("/api/notes/templates")
+def save_notes_templates_endpoint(req: NotesTemplatesRequest):
+    storage.init_db()
+    templates = _normalize_notes_templates(req.templates)
+    storage.set_ai_cache(NOTES_TEMPLATES_CACHE_KEY, json.dumps(templates))
+    return {"success": True, "count": len(templates), "templates": templates}
+
+@app.post("/api/papers/{paper_id:path}/notes/auto-summary")
+def generate_notes_auto_summary_endpoint(paper_id: str, req: Optional[NotesAutoSummaryRequest] = None):
+    storage.init_db()
+    paper = _resolve_paper_by_id(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    style = (req.style if req else "concise") or "concise"
+    block = _build_notes_auto_summary_block(paper, style=style)
+    return {
+        "paper_id": paper.get("id"),
+        "style": str(style).strip().lower(),
+        "block": block,
+    }
 
 @app.get("/api/papers/{paper_id:path}/questions")
 def get_paper_questions(paper_id: str, refresh: bool = False):
@@ -6497,6 +7129,94 @@ def delete_paper_link_endpoint(paper_id: str, link_id: str):
         raise HTTPException(status_code=404, detail="Link not found")
     return {"success": True}
 
+@app.get("/api/papers/{paper_id:path}/assignments")
+def list_paper_assignments_endpoint(
+    paper_id: str,
+    status: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = 100,
+):
+    storage.init_db()
+    paper = _resolve_paper_by_id(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    items = storage.list_paper_assignments(
+        paper_id=paper.get("id"),
+        status=status,
+        unread_only=bool(unread_only),
+        limit=limit,
+    )
+    return {"paper_id": paper.get("id"), "count": len(items), "items": items}
+
+@app.post("/api/papers/{paper_id:path}/assignments")
+def add_paper_assignment_endpoint(paper_id: str, req: AssignmentRequest):
+    storage.init_db()
+    paper = _resolve_paper_by_id(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    assignee = str(req.assignee or "").strip()
+    if not assignee:
+        raise HTTPException(status_code=400, detail="assignee is required")
+
+    due_at = str(req.due_at or "").strip() or None
+    if not due_at and req.due_in_days is not None:
+        days = max(0, min(int(req.due_in_days or 0), 365))
+        if days > 0:
+            due_at = (datetime.now() + timedelta(days=days)).isoformat()
+    created = storage.add_paper_assignment(
+        paper_id=paper.get("id"),
+        assignee=assignee,
+        due_at=due_at,
+        status=req.status,
+        note=req.note,
+    )
+    if not created:
+        raise HTTPException(status_code=500, detail="Failed to create assignment")
+    _bump_api_cache_epochs("papers")
+    return created
+
+@app.get("/api/assignments")
+def list_assignments_endpoint(
+    assignee: Optional[str] = None,
+    status: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = 150,
+):
+    storage.init_db()
+    items = storage.list_paper_assignments(
+        assignee=assignee,
+        status=status,
+        unread_only=bool(unread_only),
+        limit=limit,
+    )
+    return {"count": len(items), "items": items}
+
+@app.put("/api/assignments/{assignment_id}")
+def update_assignment_endpoint(assignment_id: str, req: AssignmentUpdateRequest):
+    storage.init_db()
+    updates: Dict[str, Any] = {}
+    if req.assignee is not None:
+        updates["assignee"] = req.assignee
+    if req.due_at is not None:
+        updates["due_at"] = req.due_at
+    if req.status is not None:
+        updates["status"] = req.status
+    if req.note is not None:
+        updates["note"] = req.note
+    item = storage.update_paper_assignment(assignment_id, updates)
+    if not item:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    _bump_api_cache_epochs("papers")
+    return item
+
+@app.post("/api/assignments/{assignment_id}/viewed")
+def mark_assignment_viewed_endpoint(assignment_id: str):
+    storage.init_db()
+    ok = storage.mark_paper_assignment_viewed(assignment_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    return {"success": True, "assignment_id": assignment_id}
+
 @app.get("/api/config")
 def get_config():
     return {
@@ -6618,6 +7338,11 @@ def create_inbox_rule(req: InboxRuleRequest):
     storage.init_db()
     scope = _normalize_rule_scope(req.scope)
     target_kind = _normalize_inbox_kind(req.target_kind)
+    try:
+        min_novelty = float(req.min_novelty or 0.0)
+    except Exception:
+        min_novelty = 0.0
+    min_novelty = max(0.0, min(1.0, min_novelty))
     rule = {
         "name": req.name,
         "enabled": bool(req.enabled),
@@ -6629,6 +7354,9 @@ def create_inbox_rule(req: InboxRuleRequest):
         "scope": scope,
         "target_kind": target_kind or None,
         "snooze_days": max(1, min(int(req.snooze_days or 3), 90)),
+        "min_novelty": min_novelty,
+        "quiet_hours_start": req.quiet_hours_start,
+        "quiet_hours_end": req.quiet_hours_end,
     }
     created = storage.add_inbox_rule(rule)
     _clear_inbox_rule_diag_cache()
@@ -6639,6 +7367,11 @@ def update_inbox_rule(rule_id: str, req: InboxRuleRequest):
     storage.init_db()
     scope = _normalize_rule_scope(req.scope)
     target_kind = _normalize_inbox_kind(req.target_kind)
+    try:
+        min_novelty = float(req.min_novelty or 0.0)
+    except Exception:
+        min_novelty = 0.0
+    min_novelty = max(0.0, min(1.0, min_novelty))
     updates = {
         "name": req.name,
         "enabled": bool(req.enabled),
@@ -6650,6 +7383,9 @@ def update_inbox_rule(rule_id: str, req: InboxRuleRequest):
         "scope": scope,
         "target_kind": target_kind or None,
         "snooze_days": max(1, min(int(req.snooze_days or 3), 90)),
+        "min_novelty": min_novelty,
+        "quiet_hours_start": req.quiet_hours_start,
+        "quiet_hours_end": req.quiet_hours_end,
     }
     storage.update_inbox_rule(rule_id, updates)
     _clear_inbox_rule_diag_cache()
@@ -6930,6 +7666,7 @@ def get_version_updates_count(
         scope=scope,
         limit=300,
         include_triaged=False,
+        count_only=True,
     )
     return {
         "scope": payload.get("scope"),
@@ -8119,6 +8856,19 @@ class FolderRequest(BaseModel):
     name: str
     query: str
     mode: str = "sql"
+    description: Optional[str] = None
+    goal: Optional[str] = None
+    target_count: int = 0
+    status: str = "active"
+
+class FolderUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    query: Optional[str] = None
+    mode: Optional[str] = None
+    description: Optional[str] = None
+    goal: Optional[str] = None
+    target_count: Optional[int] = None
+    status: Optional[str] = None
 
 @app.get("/api/folders")
 def list_folders():
@@ -8128,8 +8878,42 @@ def list_folders():
 @app.post("/api/folders")
 def create_folder(req: FolderRequest):
     storage.init_db()
-    fid = storage.create_folder(req.name, req.query, req.mode)
+    fid = storage.create_folder(
+        req.name,
+        req.query,
+        req.mode,
+        description=req.description,
+        goal=req.goal,
+        target_count=req.target_count,
+        status=req.status,
+    )
     return {"id": fid}
+
+@app.put("/api/folders/{id}")
+def update_folder_endpoint(id: str, req: FolderUpdateRequest):
+    storage.init_db()
+    folder = storage.get_folder(id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    updates: Dict[str, Any] = {}
+    if req.name is not None:
+        updates["name"] = req.name
+    if req.query is not None:
+        updates["query"] = req.query
+    if req.mode is not None:
+        updates["mode"] = req.mode
+    if req.description is not None:
+        updates["description"] = req.description
+    if req.goal is not None:
+        updates["goal"] = req.goal
+    if req.target_count is not None:
+        updates["target_count"] = req.target_count
+    if req.status is not None:
+        updates["status"] = req.status
+    updated = storage.update_folder(id, updates)
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to update folder")
+    return {"folder": updated}
 
 @app.delete("/api/folders/{id}")
 def delete_folder_endpoint(id: str):
@@ -8335,6 +9119,37 @@ def compare_papers_endpoint(req: CompareRequest):
     except Exception as e:
         print(f"Comparison Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/cross-paper-qa")
+def cross_paper_qa_endpoint(req: CrossPaperQARequest):
+    try:
+        return _run_cross_paper_qa(
+            paper_ids=req.paper_ids,
+            question=req.question,
+            top_k=req.top_k,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Cross Paper QA Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/related-graph")
+def related_graph_endpoint(req: RelatedGraphRequest):
+    storage.init_db()
+    normalized_ids = normalize_paper_ids(req.paper_ids or [])
+    if len(normalized_ids) < 1:
+        raise HTTPException(status_code=400, detail="Select at least 1 paper.")
+    graph = storage.build_related_graph(
+        normalized_ids,
+        limit_per_anchor=max(1, min(int(req.limit_per_anchor or 8), 20)),
+        min_score=max(0.0, min(float(req.min_score or 0.68), 1.0)),
+    )
+    graph["anchors"] = normalized_ids
+    graph["anchor_count"] = len(normalized_ids)
+    graph["node_count"] = len(graph.get("nodes") or [])
+    graph["edge_count"] = len(graph.get("edges") or [])
+    return graph
 
 @app.post("/api/compare/matrix")
 def compare_matrix_endpoint(req: CompareRequest):
