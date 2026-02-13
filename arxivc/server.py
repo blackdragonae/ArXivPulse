@@ -5186,6 +5186,7 @@ def get_papers(
                     offset=offset,
                     published_date=published_date_filter,
                     dedupe_latest=(status == "new"),
+                    include_liked_in_new=(status == "new"),
                 )
 
             for p in result:
@@ -5223,7 +5224,10 @@ def get_papers(
         if status == 'bookmarked':
             papers = storage.get_papers_by_ids(list(raw_bookmarked_ids))
         else:
-            papers = storage.get_papers_by_status(status)
+            papers = storage.get_papers_by_status(
+                status,
+                include_liked_in_new=(status == "new"),
+            )
 
             # Only filter 'new' papers by date.
             # Favorites and Dismissed should show all history regardless of the date picker.

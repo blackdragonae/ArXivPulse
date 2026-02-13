@@ -1291,18 +1291,31 @@ def save_papers(papers: List[Dict[str, Any]]):
         index_papers_text(fts_rows)
     return len(new_papers)
 
-def get_papers_by_status(status: str = 'new') -> List[Dict[str, Any]]:
+def get_papers_by_status(status: str = 'new', include_liked_in_new: bool = False) -> List[Dict[str, Any]]:
     """Retrieves papers with a specific interaction status."""
     conn = _connect()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
-    c.execute('''
-        SELECT p.*, i.status 
-        FROM papers p
-        JOIN interactions i ON p.id = i.paper_id
-        WHERE i.status = ?
-    ''', (status,))
+
+    if status == "new" and include_liked_in_new:
+        c.execute(
+            '''
+            SELECT p.*, i.status
+            FROM papers p
+            JOIN interactions i ON p.id = i.paper_id
+            WHERE i.status IN ('new', 'liked')
+            '''
+        )
+    else:
+        c.execute(
+            '''
+            SELECT p.*, i.status
+            FROM papers p
+            JOIN interactions i ON p.id = i.paper_id
+            WHERE i.status = ?
+            ''',
+            (status,),
+        )
     
     rows = c.fetchall()
     papers = []
@@ -1322,6 +1335,7 @@ def get_papers_page_by_status(
     dedupe_latest: bool = False,
     query_text: Optional[str] = None,
     include_total: bool = True,
+    include_liked_in_new: bool = False,
 ) -> tuple[List[Dict[str, Any]], Optional[int]]:
     """
     Returns a paged slice for a status, plus total count.
@@ -1334,7 +1348,12 @@ def get_papers_page_by_status(
     c = conn.cursor()
 
     date_clause = ""
-    params: List[Any] = [status]
+    status_clause = "i.status = ?"
+    status_params: List[Any] = [status]
+    if status == "new" and include_liked_in_new:
+        status_clause = "i.status IN (?, ?)"
+        status_params = ["new", "liked"]
+    params: List[Any] = list(status_params)
     if published_date:
         date_clause = " AND substr(p.published, 1, 10) = ?"
         params.append(str(published_date))
@@ -1357,7 +1376,7 @@ def get_papers_page_by_status(
                 SELECT COUNT(*)
                 FROM papers p
                 JOIN interactions i ON p.id = i.paper_id
-                WHERE i.status = ?{where_clause}
+                WHERE {status_clause}{where_clause}
                 ''',
                 params,
             )
@@ -1368,7 +1387,7 @@ def get_papers_page_by_status(
             SELECT p.*, i.status
             FROM papers p
             JOIN interactions i ON p.id = i.paper_id
-            WHERE i.status = ?{where_clause}
+            WHERE {status_clause}{where_clause}
             ORDER BY p.published DESC
             LIMIT ? OFFSET ?
             ''',
@@ -1393,7 +1412,7 @@ def get_papers_page_by_status(
             ) AS _rn
         FROM papers p
         JOIN interactions i ON p.id = i.paper_id
-        WHERE i.status = ?{where_clause}
+        WHERE {status_clause}{where_clause}
     '''
     try:
         total: Optional[int] = None
@@ -1422,7 +1441,7 @@ def get_papers_page_by_status(
     except sqlite3.OperationalError:
         # Fallback for SQLite builds without window functions.
         conn.close()
-        rows = get_papers_by_status(status=status)
+        rows = get_papers_by_status(status=status, include_liked_in_new=include_liked_in_new)
         if published_date:
             rows = [p for p in rows if str(p.get("published", "")).startswith(str(published_date))]
         if clean_query:

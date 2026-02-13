@@ -28,6 +28,7 @@ let schedulerLeaderTimer = null;
 let changeSummarySnapshot = null;
 let changeSummarySince = null;
 let activeFolderSchedule = { id: null, name: '' };
+let activeFolderEditor = null;
 const JOB_POLL_INTERVAL_MS = 1200;
 const JOB_POLL_TIMEOUT_MS = 180000;
 const LAZY_LIB_SOURCES = {
@@ -126,6 +127,7 @@ let lastReadingPlanAction = null;
 let activeNotesUpdatedAt = '';
 let activeReadingStatus = 'queue';
 let citationOverlayNetwork = null;
+let relatedGraphNetwork = null;
 let benchmarkTableState = { payload: null, sortKey: 'dataset', sortDir: 1 };
 let lineageNetwork = null;
 let digestFilterState = { cadence: 'all', unreadOnly: false };
@@ -147,6 +149,7 @@ let dayRunPresetsCache = [];
 let trailEntries = [];
 let trailSessionId = null;
 let inboxRulesCache = [];
+let notesTemplatesCache = [];
 let inboxRulesPreviewCache = [];
 let inboxRulesAuditCache = [];
 let inboxRulesDiagnosticsCache = [];
@@ -199,6 +202,8 @@ function closeModalById(modalId) {
         battleModal: () => window.closeBattleModal && window.closeBattleModal(),
         compareMatrixModal: () => window.closeCompareMatrixModal && window.closeCompareMatrixModal(),
         compareDiffModal: () => window.closeCompareDiffModal && window.closeCompareDiffModal(),
+        crossPaperQaModal: () => window.closeCrossPaperQaModal && window.closeCrossPaperQaModal(),
+        relatedGraphModal: () => window.closeRelatedGraphModal && window.closeRelatedGraphModal(),
         benchmarkModal: () => window.closeBenchmarkModal && window.closeBenchmarkModal(),
         citationOverlayModal: () => window.closeCitationOverlayModal && window.closeCitationOverlayModal(),
         reproModal: () => window.closeReproModal && window.closeReproModal(),
@@ -2963,6 +2968,7 @@ function createPaperCard(paper) {
     const showReading = Boolean(readingStatus) || readingProgress > 0;
     const readingLabel = readingStatus ? readingStatus.charAt(0).toUpperCase() + readingStatus.slice(1) : 'Queue';
     const hasNotes = Boolean(paper.has_notes) || Boolean(paper.notes && String(paper.notes).trim().length > 0);
+    const isLikedPaper = String(paper.status || '').toLowerCase() === 'liked';
     const versionChangedFields = Array.isArray(paper.version_changed_fields)
         ? paper.version_changed_fields.filter((name) => name)
         : [];
@@ -2987,6 +2993,8 @@ function createPaperCard(paper) {
                 ${labels.map(label => `<span class="tag label-tag">${escapeHtml(label)}</span>`).join('')}
                 ${(paper.categories || []).map(cat => `<span class="tag">${cat}</span>`).join('')}
                 ${paper.reading_time_minutes ? `<span class="tag readtime-tag" title="Estimated reading time">${`~${paper.reading_time_minutes} min`}</span>` : ''}
+                ${Number(paper.assignment_open_count || 0) > 0 ? `<span class="tag" style="background:rgba(251,191,36,0.14); color:#fcd34d;">tasks ${Number(paper.assignment_open_count || 0)}</span>` : ''}
+                ${Number(paper.assignment_unread_count || 0) > 0 ? `<span class="tag" style="background:rgba(248,113,113,0.18); color:#fca5a5;">unread ${Number(paper.assignment_unread_count || 0)}</span>` : ''}
                 ${(paper.concepts || []).map(c => `<span class="tag" style="background:rgba(16, 185, 129, 0.2); color:#34d399; border:1px solid rgba(16, 185, 129, 0.3); cursor:pointer;" onclick="filterByConcept('${c}')">${c}</span>`).join('')}
             </div>
             <span>
@@ -3091,7 +3099,7 @@ function createPaperCard(paper) {
             <button class="action-btn export" onclick="exportPaper('${paper.id}', this)" title="Export to Obsidian">
                 <i class="fa-solid fa-file-export"></i>
             </button>
-            ${currentStatus !== 'liked' ? `
+            ${!isLikedPaper ? `
                     <button class="action-btn like" onclick="handleRate('${paper.id}', 'liked', this)">
                         <i class="fa-regular fa-heart"></i>
                     </button>
@@ -3120,22 +3128,30 @@ window.handleRate = async (id, status, btnElement) => {
 
         if (!res.ok) throw new Error("API Error");
 
-        // Visual feedback
+        const keepCardInCurrentFeed = (
+            status === 'liked' && (currentStatus === 'new' || currentStatus === 'bookmarked')
+        );
         const card = btnElement.closest('.paper-card');
+        if (keepCardInCurrentFeed) {
+            allPapers = allPapers.map((p) => (p.id === id ? { ...p, status: 'liked' } : p));
+            currentVisiblePapers = currentVisiblePapers.map((p) => (p.id === id ? { ...p, status: 'liked' } : p));
+            invalidateFavoritesCache();
+            renderPaperGrid(currentVisiblePapers);
+            refreshAllBadges({ force: true });
+            return;
+        }
+
         allPapers = allPapers.filter((p) => p.id !== id);
         currentVisiblePapers = currentVisiblePapers.filter((p) => p.id !== id);
         invalidateFavoritesCache();
 
         if (virtualState.enabled) {
             renderPaperGrid(currentVisiblePapers);
+            refreshAllBadges({ force: true });
             return;
         }
 
-        // If we represent a "move", animate out
-        // valid moves: new -> liked (vanish from new), new -> dismissed (vanish from new)
-        // liked -> dismissed (vanish from liked)
-
-        // Animate out
+        // Animate out when the target feed should no longer contain this item.
         card.style.transform = 'scale(0.95)';
         card.style.opacity = '0';
         setTimeout(() => {
@@ -3145,6 +3161,7 @@ window.handleRate = async (id, status, btnElement) => {
                 paperGrid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; margin-top: 2rem; color: #94a3b8;">All caught up!</div>';
             }
         }, 300);
+        refreshAllBadges({ force: true });
 
     } catch (err) {
         console.error("Rate Error:", err);
@@ -4088,12 +4105,15 @@ function setReadingPlanUndoState(action, paperId, paperTitle = '') {
 function getReadingPlanOptionsFromUi() {
     const totalInput = document.getElementById('planTotalMinutes');
     const maxInput = document.getElementById('planMaxItems');
+    const budgetMode = document.getElementById('planBudgetMode');
     const includeNew = document.getElementById('planIncludeNew');
     const includeLiked = document.getElementById('planIncludeLiked');
     const includeBookmarked = document.getElementById('planIncludeBookmarked');
+    const mode = String(budgetMode?.value || 'balanced').toLowerCase();
     return {
         total_minutes: Math.max(10, Math.min(360, Number(totalInput?.value || 60))),
         max_items: Math.max(1, Math.min(20, Number(maxInput?.value || 6))),
+        budget_mode: ['balanced', 'focus', 'sprint', 'deep'].includes(mode) ? mode : 'balanced',
         include_new: Boolean(includeNew?.checked),
         include_liked: Boolean(includeLiked?.checked),
         include_bookmarked: Boolean(includeBookmarked?.checked),
@@ -4104,15 +4124,42 @@ function applyReadingPlanOptionsToUi(options) {
     if (!options || typeof options !== 'object') return;
     const totalInput = document.getElementById('planTotalMinutes');
     const maxInput = document.getElementById('planMaxItems');
+    const budgetMode = document.getElementById('planBudgetMode');
     const includeNew = document.getElementById('planIncludeNew');
     const includeLiked = document.getElementById('planIncludeLiked');
     const includeBookmarked = document.getElementById('planIncludeBookmarked');
     if (totalInput && options.total_minutes != null) totalInput.value = String(Number(options.total_minutes));
     if (maxInput && options.max_items != null) maxInput.value = String(Number(options.max_items));
+    if (budgetMode && options.budget_mode != null) budgetMode.value = String(options.budget_mode);
     if (includeNew && options.include_new != null) includeNew.checked = Boolean(options.include_new);
     if (includeLiked && options.include_liked != null) includeLiked.checked = Boolean(options.include_liked);
     if (includeBookmarked && options.include_bookmarked != null) includeBookmarked.checked = Boolean(options.include_bookmarked);
 }
+
+window.applyReadingPlanPreset = async (preset) => {
+    const mode = String(preset || '').toLowerCase();
+    const totalInput = document.getElementById('planTotalMinutes');
+    const maxInput = document.getElementById('planMaxItems');
+    const budgetMode = document.getElementById('planBudgetMode');
+    const includeNew = document.getElementById('planIncludeNew');
+    const includeLiked = document.getElementById('planIncludeLiked');
+    const includeBookmarked = document.getElementById('planIncludeBookmarked');
+
+    const presets = {
+        sprint: { total: 30, max: 4, mode: 'sprint', includeNew: true, includeLiked: true, includeBookmarked: true },
+        focus: { total: 60, max: 5, mode: 'focus', includeNew: true, includeLiked: true, includeBookmarked: true },
+        balanced: { total: 90, max: 7, mode: 'balanced', includeNew: true, includeLiked: true, includeBookmarked: true },
+        deep: { total: 120, max: 4, mode: 'deep', includeNew: false, includeLiked: true, includeBookmarked: true },
+    };
+    const selected = presets[mode] || presets.balanced;
+    if (totalInput) totalInput.value = String(selected.total);
+    if (maxInput) maxInput.value = String(selected.max);
+    if (budgetMode) budgetMode.value = selected.mode;
+    if (includeNew) includeNew.checked = Boolean(selected.includeNew);
+    if (includeLiked) includeLiked.checked = Boolean(selected.includeLiked);
+    if (includeBookmarked) includeBookmarked.checked = Boolean(selected.includeBookmarked);
+    await generateReadingPlan(true);
+};
 
 function renderReadingPlan(payload) {
     const listEl = document.getElementById('readingPlanList');
@@ -4123,8 +4170,9 @@ function renderReadingPlan(payload) {
     const count = Number(payload?.count || items.length || 0);
     const cached = Boolean(payload?.cached);
     const deferredCount = Number(payload?.deferred_count || 0);
+    const budgetMode = String(payload?.options?.budget_mode || payload?.budget_mode || 'balanced');
     setReadingPlanStatus(
-        `${count} item${count === 1 ? '' : 's'} · ${planned}/${budget} min planned${deferredCount ? ` · deferred ${deferredCount}` : ''}${cached ? ' · cached' : ''}`
+        `${count} item${count === 1 ? '' : 's'} · ${planned}/${budget} min planned · mode ${budgetMode}${deferredCount ? ` · deferred ${deferredCount}` : ''}${cached ? ' · cached' : ''}`
     );
 
     if (!items.length) {
@@ -4237,6 +4285,7 @@ window.loadTodayReadingPlan = async (refresh = false) => {
         applyReadingPlanOptionsToUi(data.options || {
             total_minutes: data.total_minutes_budget,
             max_items: data.max_items,
+            budget_mode: 'balanced',
             include_new: true,
             include_liked: true,
             include_bookmarked: true,
@@ -4261,6 +4310,7 @@ window.generateReadingPlan = async (refresh = true) => {
             body: JSON.stringify({
                 total_minutes: options.total_minutes,
                 max_items: options.max_items,
+                budget_mode: options.budget_mode,
                 include_new: options.include_new,
                 include_liked: options.include_liked,
                 include_bookmarked: options.include_bookmarked,
@@ -4299,6 +4349,7 @@ window.loadSelectedReadingPlanHistory = async () => {
         applyReadingPlanOptionsToUi(data.options || {
             total_minutes: data.total_minutes_budget,
             max_items: data.max_items,
+            budget_mode: 'balanced',
             include_new: true,
             include_liked: true,
             include_bookmarked: true,
@@ -4480,6 +4531,131 @@ window.addTeamNote = async () => {
     }
 };
 
+function setNotesTemplateStatus(message, isError = false) {
+    const statusEl = document.getElementById('notesTemplateStatus');
+    if (!statusEl) return;
+    statusEl.textContent = message || '';
+    statusEl.style.color = isError ? 'var(--danger)' : 'var(--text-muted)';
+}
+
+function renderNotesTemplateOptions() {
+    const select = document.getElementById('notesTemplateSelect');
+    if (!select) return;
+    const items = Array.isArray(notesTemplatesCache) ? notesTemplatesCache : [];
+    const currentValue = select.value || '';
+    const options = ['<option value="">Select template...</option>'];
+    items.forEach((tpl) => {
+        const id = String(tpl.id || '').trim();
+        const name = String(tpl.name || id || 'Template').trim();
+        if (!id) return;
+        options.push(`<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`);
+    });
+    select.innerHTML = options.join('');
+    if (currentValue && items.some((tpl) => String(tpl.id || '') === currentValue)) {
+        select.value = currentValue;
+    }
+}
+
+async function loadNotesTemplates() {
+    try {
+        const res = await fetch(`${API_BASE}/notes/templates`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to load templates");
+        notesTemplatesCache = Array.isArray(data.templates) ? data.templates : [];
+        renderNotesTemplateOptions();
+    } catch (e) {
+        setNotesTemplateStatus(`Templates unavailable: ${e.message}`, true);
+    }
+}
+
+window.applyNotesTemplate = (append = false) => {
+    const select = document.getElementById('notesTemplateSelect');
+    const input = document.getElementById('notesInput');
+    if (!select || !input) return;
+    const templateId = String(select.value || '').trim();
+    if (!templateId) {
+        alert("Choose a template first.");
+        return;
+    }
+    const template = (notesTemplatesCache || []).find((tpl) => String(tpl.id || '') === templateId);
+    if (!template) {
+        alert("Selected template not found.");
+        return;
+    }
+    const body = String(template.body || '').trim();
+    if (!body) return;
+    if (append && input.value.trim()) {
+        input.value = `${input.value.trim()}\n\n${body}\n`;
+    } else {
+        input.value = `${body}\n`;
+    }
+    setNotesTemplateStatus(`Applied template: ${template.name || template.id}`);
+};
+
+window.saveCurrentAsTemplate = async () => {
+    const input = document.getElementById('notesInput');
+    if (!input) return;
+    const body = String(input.value || '').trim();
+    if (!body) {
+        alert("Write notes content before saving as a template.");
+        return;
+    }
+    const name = (prompt("Template name:") || '').trim();
+    if (!name) return;
+    const templateId = reSafeTemplateId(name);
+    const existing = Array.isArray(notesTemplatesCache) ? notesTemplatesCache : [];
+    const next = existing.filter((tpl) => String(tpl.id || '') !== templateId);
+    next.unshift({ id: templateId, name, body });
+    try {
+        const res = await fetch(`${API_BASE}/notes/templates`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ templates: next })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to save template");
+        notesTemplatesCache = Array.isArray(data.templates) ? data.templates : [];
+        renderNotesTemplateOptions();
+        const select = document.getElementById('notesTemplateSelect');
+        if (select) select.value = templateId;
+        setNotesTemplateStatus(`Saved template: ${name}`);
+    } catch (e) {
+        setNotesTemplateStatus(`Save failed: ${e.message}`, true);
+    }
+};
+
+function reSafeTemplateId(name) {
+    const raw = String(name || '').toLowerCase().trim();
+    const slug = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug || `template-${Date.now()}`;
+}
+
+window.insertAutoSummaryBlock = async () => {
+    if (!activeNotesPaperId) return;
+    const styleInput = document.getElementById('notesAutoSummaryStyle');
+    const input = document.getElementById('notesInput');
+    if (!input) return;
+    const style = String(styleInput?.value || 'concise').toLowerCase();
+    setNotesTemplateStatus('Generating auto-summary...');
+    try {
+        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(activeNotesPaperId)}/notes/auto-summary`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ style })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to generate auto-summary");
+        const block = String(data.block || '').trim();
+        if (!block) throw new Error("No summary block returned");
+        input.value = input.value.trim()
+            ? `${input.value.trim()}\n\n${block}\n`
+            : `${block}\n`;
+        setNotesTemplateStatus(`Inserted auto-summary (${style}).`);
+    } catch (e) {
+        setNotesTemplateStatus(`Auto-summary failed: ${e.message}`, true);
+    }
+};
+
 window.openNotesModal = async (paperId) => {
     activeNotesPaperId = paperId;
     activeNotesUpdatedAt = '';
@@ -4501,12 +4677,23 @@ window.openNotesModal = async (paperId) => {
     updateWeeklyPickToggle(paperId);
     loadTeamNotes(paperId);
     loadPaperLinks(paperId);
+    loadAssignments(paperId);
     const followStatus = document.getElementById('followupStatus');
     if (followStatus) followStatus.textContent = '';
+    const assignmentStatus = document.getElementById('assignmentStatusLabel');
+    if (assignmentStatus) assignmentStatus.textContent = '';
+    setNotesTemplateStatus('');
     const followNote = document.getElementById('followupNoteInput');
     if (followNote) followNote.value = '';
     const followDays = document.getElementById('followupDaysInput');
     if (followDays && !followDays.value) followDays.value = '7';
+    const assignmentAssignee = document.getElementById('assignmentAssigneeInput');
+    if (assignmentAssignee && !assignmentAssignee.value) assignmentAssignee.value = '';
+    const assignmentDueDays = document.getElementById('assignmentDueDaysInput');
+    if (assignmentDueDays && !assignmentDueDays.value) assignmentDueDays.value = '7';
+    const assignmentNote = document.getElementById('assignmentNoteInput');
+    if (assignmentNote) assignmentNote.value = '';
+    await loadNotesTemplates();
 
     try {
         const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(paperId)}/notes`);
@@ -4580,6 +4767,121 @@ window.setFollowUp = async () => {
         await refreshFollowupsBadge();
     } catch (e) {
         if (statusEl) statusEl.textContent = `Failed: ${e.message}`;
+    }
+};
+
+async function loadAssignments(paperId) {
+    const list = document.getElementById('assignmentList');
+    if (!list || !paperId) return;
+    list.innerHTML = '<div class="loader"></div>';
+    try {
+        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(paperId)}/assignments?limit=80`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to load assignments");
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (!items.length) {
+            list.textContent = 'No assignments yet.';
+            return;
+        }
+        list.innerHTML = items.map((a) => `
+            <div class="notes-history-item">
+                <div class="notes-history-meta">
+                    <span>@${escapeHtml(a.assignee || 'unknown')}</span>
+                    <span>${escapeHtml(formatIsoShort(a.updated_at || a.created_at || ''))}</span>
+                </div>
+                <div style="display:flex; gap:0.45rem; align-items:center; flex-wrap:wrap; margin-top:0.25rem;">
+                    <span class="tag">${escapeHtml(a.status || 'todo')}</span>
+                    ${a.unread ? '<span class="tag" style="background:rgba(248,113,113,0.2); color:#fecaca;">unread</span>' : ''}
+                    ${a.due_at ? `<span class="tag" style="background:rgba(56,189,248,0.15); color:#7dd3fc;">due ${escapeHtml(String(a.due_at).slice(0, 10))}</span>` : ''}
+                </div>
+                ${a.note ? `<div class="notes-history-preview">${escapeHtml(a.note)}</div>` : ''}
+                <div class="notes-history-actions">
+                    <select onchange="updateAssignmentStatus('${escapeHtml(String(a.id || ''))}', this.value)"
+                        style="padding:0.35rem 0.45rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                        <option value="todo" ${a.status === 'todo' ? 'selected' : ''}>todo</option>
+                        <option value="in_progress" ${a.status === 'in_progress' ? 'selected' : ''}>in_progress</option>
+                        <option value="blocked" ${a.status === 'blocked' ? 'selected' : ''}>blocked</option>
+                        <option value="done" ${a.status === 'done' ? 'selected' : ''}>done</option>
+                    </select>
+                    <button class="btn-secondary" onclick="markAssignmentViewed('${escapeHtml(String(a.id || ''))}')">
+                        <i class="fa-solid fa-eye"></i> Viewed
+                    </button>
+                </div>
+            </div>
+        `).join('');
+    } catch (e) {
+        list.innerHTML = `<div style="color:var(--danger)">Failed to load assignments: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+window.addAssignment = async () => {
+    if (!activeNotesPaperId) return;
+    const assigneeInput = document.getElementById('assignmentAssigneeInput');
+    const dueDaysInput = document.getElementById('assignmentDueDaysInput');
+    const statusInput = document.getElementById('assignmentStatusInput');
+    const noteInput = document.getElementById('assignmentNoteInput');
+    const statusEl = document.getElementById('assignmentStatusLabel');
+    const assignee = (assigneeInput?.value || '').trim();
+    const dueDays = Number(dueDaysInput?.value || 0);
+    const status = String(statusInput?.value || 'todo').toLowerCase();
+    const note = (noteInput?.value || '').trim();
+    if (!assignee) {
+        alert("Assignee is required.");
+        return;
+    }
+    if (statusEl) statusEl.textContent = 'Saving assignment...';
+    try {
+        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(activeNotesPaperId)}/assignments`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                assignee,
+                due_in_days: Number.isFinite(dueDays) ? Math.max(0, Math.min(365, Math.round(dueDays))) : null,
+                status,
+                note,
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to create assignment");
+        if (statusEl) statusEl.textContent = 'Assignment saved.';
+        if (noteInput) noteInput.value = '';
+        await loadAssignments(activeNotesPaperId);
+        await loadPapers();
+    } catch (e) {
+        if (statusEl) statusEl.textContent = `Failed: ${e.message}`;
+    }
+};
+
+window.updateAssignmentStatus = async (assignmentId, status) => {
+    if (!assignmentId) return;
+    const statusEl = document.getElementById('assignmentStatusLabel');
+    if (statusEl) statusEl.textContent = 'Updating assignment...';
+    try {
+        const res = await fetch(`${API_BASE}/assignments/${encodeURIComponent(assignmentId)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: String(status || 'todo').toLowerCase() })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to update assignment");
+        if (statusEl) statusEl.textContent = 'Assignment updated.';
+        if (activeNotesPaperId) await loadAssignments(activeNotesPaperId);
+        await loadPapers();
+    } catch (e) {
+        if (statusEl) statusEl.textContent = `Update failed: ${e.message}`;
+    }
+};
+
+window.markAssignmentViewed = async (assignmentId) => {
+    if (!assignmentId) return;
+    try {
+        const res = await fetch(`${API_BASE}/assignments/${encodeURIComponent(assignmentId)}/viewed`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to mark assignment viewed");
+        if (activeNotesPaperId) await loadAssignments(activeNotesPaperId);
+        await loadPapers();
+    } catch (e) {
+        alert(`Failed: ${e.message}`);
     }
 };
 
@@ -6062,6 +6364,7 @@ window.openSearchAgentsModal = async () => {
         summaryBox.style.display = 'none';
         summaryBox.innerHTML = '';
     }
+    updateSearchAgentFormUi();
     await loadSearchAgents();
 };
 
@@ -6158,8 +6461,16 @@ window.loadSearchAgents = async () => {
                 <div style="display:flex; justify-content:space-between; gap:0.8rem; align-items:flex-start;">
                     <div>
                         <div style="font-weight:700;">${escapeHtml(a.name)}</div>
-                        <div style="font-size:0.85rem; color:var(--text-muted); margin-top:0.2rem;"><code>${escapeHtml(a.query)}</code></div>
+                        <div style="font-size:0.85rem; color:var(--text-muted); margin-top:0.2rem;">
+                            ${(a.query || '').trim()
+                ? `<code>${escapeHtml(a.query)}</code>`
+                : '<span style="opacity:0.75;">(semantic seed mode)</span>'}
+                        </div>
+                        ${(a.source_paper_id || '').trim()
+                ? `<div style="font-size:0.77rem; color:var(--text-muted); margin-top:0.2rem;">source: <code>${escapeHtml(String(a.source_paper_id || ''))}</code></div>`
+                : ''}
                         <div style="display:flex; gap:0.45rem; margin-top:0.35rem;">
+                            <span class="tag">${escapeHtml(a.mode || 'global')}</span>
                             <span class="tag">${escapeHtml(a.cadence || 'daily')}</span>
                             <span class="tag">max ${Number(a.max_results || 8)}</span>
                             ${a.last_run_at ? `<span class="tag" title="${escapeHtml(a.last_run_at)}">ran</span>` : '<span class="tag">never ran</span>'}
@@ -6183,19 +6494,55 @@ window.loadSearchAgents = async () => {
     }
 };
 
+window.updateSearchAgentFormUi = () => {
+    const modeEl = document.getElementById('agentModeInput');
+    const queryEl = document.getElementById('agentQueryInput');
+    const sourceEl = document.getElementById('agentSourcePaperInput');
+    const hintEl = document.getElementById('agentFormHint');
+    const mode = String(modeEl?.value || 'global').toLowerCase();
+    if (queryEl) {
+        queryEl.placeholder = mode === 'semantic'
+            ? 'Optional semantic seed text (or leave empty and use source paper)'
+            : 'e.g. ti:"diffusion" AND cat:cs.CV';
+    }
+    if (hintEl) {
+        hintEl.textContent = mode === 'semantic'
+            ? 'Semantic mode: use query text and/or a source paper from your library.'
+            : 'Global/local modes require a query. Local runs over your indexed library.';
+    }
+    if (sourceEl) {
+        sourceEl.placeholder = mode === 'semantic'
+            ? 'Required if query is empty: paper ID/URL from your library'
+            : 'Optional';
+    }
+};
+
 window.createSearchAgent = async () => {
     const nameEl = document.getElementById('agentNameInput');
     const queryEl = document.getElementById('agentQueryInput');
+    const modeEl = document.getElementById('agentModeInput');
+    const sourceEl = document.getElementById('agentSourcePaperInput');
     const cadenceEl = document.getElementById('agentCadenceInput');
     const maxEl = document.getElementById('agentMaxResultsInput');
 
     const name = (nameEl ? nameEl.value : '').trim();
     const query = (queryEl ? queryEl.value : '').trim();
+    const modeRaw = (modeEl ? modeEl.value : 'global').trim().toLowerCase();
+    const mode = ['global', 'semantic', 'local'].includes(modeRaw) ? modeRaw : 'global';
+    const sourcePaperId = (sourceEl ? sourceEl.value : '').trim();
     const cadence = (cadenceEl ? cadenceEl.value : 'daily').trim().toLowerCase();
     const maxResults = Number.parseInt(maxEl ? maxEl.value : '8', 10);
 
-    if (!name || !query) {
-        alert("Please provide both a name and query.");
+    if (!name) {
+        alert("Please provide an agent name.");
+        return;
+    }
+    if (mode !== 'semantic' && !query) {
+        alert("Please provide a query for global/local modes.");
+        return;
+    }
+    if (mode === 'semantic' && !query && !sourcePaperId) {
+        alert("Semantic mode needs query text or a source paper ID.");
         return;
     }
 
@@ -6206,6 +6553,8 @@ window.createSearchAgent = async () => {
             body: JSON.stringify({
                 name,
                 query,
+                mode,
+                source_paper_id: sourcePaperId || null,
                 cadence: cadence === 'weekly' ? 'weekly' : 'daily',
                 max_results: Number.isFinite(maxResults) ? Math.max(1, maxResults) : 8
             })
@@ -6214,6 +6563,8 @@ window.createSearchAgent = async () => {
         if (!res.ok) throw new Error(data.detail || "Failed to save agent");
 
         if (nameEl) nameEl.value = '';
+        if (queryEl) queryEl.value = '';
+        if (sourceEl) sourceEl.value = '';
         await loadSearchAgents();
     } catch (e) {
         console.error(e);
@@ -6710,6 +7061,12 @@ window.loadInboxRules = async () => {
                             ${rule.authors?.length ? ` · Authors: ${escapeHtml(rule.authors.join(', '))}` : ''}
                             ${rule.venues?.length ? ` · Categories: ${escapeHtml(rule.venues.join(', '))}` : ''}
                         </div>
+                        <div style="font-size:0.78rem; color:var(--text-muted); margin-top:0.15rem;">
+                            ${Number(rule.min_novelty || 0) > 0 ? `Min novelty: ${Number(rule.min_novelty).toFixed(2)}` : ''}
+                            ${(Number(rule.quiet_hours_start) >= 0 && Number(rule.quiet_hours_end) >= 0)
+                ? ` · Quiet hours: ${Number(rule.quiet_hours_start)}:00-${Number(rule.quiet_hours_end)}:00`
+                : ''}
+                        </div>
                     </div>
                     <div style="display:flex; gap:0.4rem; align-items:center;">
                         <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.85rem; color:var(--text-muted);">
@@ -6737,6 +7094,12 @@ function getInboxRuleFormPayload() {
     const targetKind = targetRaw || null;
     const label = document.getElementById('inboxRuleLabel')?.value?.trim() || '';
     const snoozeDays = Math.max(1, Math.min(90, Number(document.getElementById('inboxRuleSnoozeDays')?.value || 3)));
+    const minNoveltyRaw = Number(document.getElementById('inboxRuleMinNovelty')?.value || 0);
+    const minNovelty = Number.isFinite(minNoveltyRaw) ? Math.max(0, Math.min(1, minNoveltyRaw)) : 0;
+    const quietStartRaw = Number(document.getElementById('inboxRuleQuietStart')?.value ?? -1);
+    const quietEndRaw = Number(document.getElementById('inboxRuleQuietEnd')?.value ?? -1);
+    const quietStart = Number.isInteger(quietStartRaw) && quietStartRaw >= 0 && quietStartRaw <= 23 ? quietStartRaw : -1;
+    const quietEnd = Number.isInteger(quietEndRaw) && quietEndRaw >= 0 && quietEndRaw <= 23 ? quietEndRaw : -1;
     const keywords = parseRuleList(document.getElementById('inboxRuleKeywords')?.value);
     const authors = parseRuleList(document.getElementById('inboxRuleAuthors')?.value);
     const venues = parseRuleList(document.getElementById('inboxRuleVenues')?.value);
@@ -6748,6 +7111,9 @@ function getInboxRuleFormPayload() {
         target_kind: targetKind,
         label: label || null,
         snooze_days: snoozeDays,
+        min_novelty: minNovelty,
+        quiet_hours_start: quietStart,
+        quiet_hours_end: quietEnd,
         keywords,
         authors,
         venues,
@@ -6762,6 +7128,9 @@ function resetInboxRuleForm() {
     const target = document.getElementById('inboxRuleTargetKind');
     const label = document.getElementById('inboxRuleLabel');
     const snooze = document.getElementById('inboxRuleSnoozeDays');
+    const minNovelty = document.getElementById('inboxRuleMinNovelty');
+    const quietStart = document.getElementById('inboxRuleQuietStart');
+    const quietEnd = document.getElementById('inboxRuleQuietEnd');
     const keywords = document.getElementById('inboxRuleKeywords');
     const authors = document.getElementById('inboxRuleAuthors');
     const venues = document.getElementById('inboxRuleVenues');
@@ -6772,6 +7141,9 @@ function resetInboxRuleForm() {
     if (target) target.value = '';
     if (label) label.value = '';
     if (snooze) snooze.value = '3';
+    if (minNovelty) minNovelty.value = '0';
+    if (quietStart) quietStart.value = '-1';
+    if (quietEnd) quietEnd.value = '-1';
     if (keywords) keywords.value = '';
     if (authors) authors.value = '';
     if (venues) venues.value = '';
@@ -6827,6 +7199,9 @@ window.toggleInboxRule = async (ruleId, enabled) => {
                 scope: rule.scope || 'papers',
                 target_kind: rule.target_kind || null,
                 snooze_days: Number(rule.snooze_days || 3),
+                min_novelty: Number(rule.min_novelty || 0),
+                quiet_hours_start: Number(rule.quiet_hours_start ?? -1),
+                quiet_hours_end: Number(rule.quiet_hours_end ?? -1),
                 enabled: Boolean(enabled)
             })
         });
@@ -7550,6 +7925,117 @@ window.closeCitationOverlayModal = () => {
         citationOverlayNetwork.destroy();
     }
     citationOverlayNetwork = null;
+};
+
+window.openRelatedGraphModal = async () => {
+    const ids = Array.from(selectedPaperIds || []);
+    if (ids.length < 1) {
+        alert("Select at least 1 paper.");
+        return;
+    }
+    showModal('relatedGraphModal');
+    await runRelatedGraph();
+};
+
+window.closeRelatedGraphModal = () => {
+    hideModal('relatedGraphModal');
+    if (relatedGraphNetwork && typeof relatedGraphNetwork.destroy === 'function') {
+        relatedGraphNetwork.destroy();
+    }
+    relatedGraphNetwork = null;
+};
+
+window.runRelatedGraph = async () => {
+    const ids = Array.from(selectedPaperIds || []);
+    const container = document.getElementById('relatedGraphContainer');
+    const meta = document.getElementById('relatedGraphMeta');
+    const perAnchorInput = document.getElementById('relatedGraphLimitInput');
+    const minScoreInput = document.getElementById('relatedGraphMinScoreInput');
+    const limitPerAnchor = Math.max(1, Math.min(20, Number(perAnchorInput?.value || 8)));
+    const minScore = Math.max(0.0, Math.min(1.0, Number(minScoreInput?.value || 0.68)));
+    if (ids.length < 1) {
+        if (meta) meta.textContent = 'Select at least 1 paper.';
+        return;
+    }
+    if (meta) meta.textContent = 'Building related graph...';
+    if (container) container.innerHTML = '<div class="loader" style="margin-top:35%;"></div>';
+
+    try {
+        await ensureVisLib();
+    } catch (e) {
+        if (container) container.innerHTML = `<div style="color:var(--danger); text-align:center; margin-top:35%;">Failed to load graph library.</div>`;
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API_BASE}/related-graph`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                paper_ids: ids,
+                limit_per_anchor: limitPerAnchor,
+                min_score: minScore,
+            }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to build related graph.");
+
+        const nodesData = Array.isArray(data.nodes) ? data.nodes : [];
+        const edgesData = Array.isArray(data.edges) ? data.edges : [];
+        if (meta) {
+            meta.textContent = `Anchors: ${Number(data.anchor_count || ids.length)} · Nodes: ${nodesData.length} · Edges: ${edgesData.length}`;
+        }
+        if (!nodesData.length) {
+            if (container) container.innerHTML = `<div style="color:var(--text-muted); text-align:center; margin-top:35%;">No related graph data available.</div>`;
+            return;
+        }
+
+        const nodes = new vis.DataSet(nodesData.map((n) => {
+            const anchor = String(n.group || '') === 'anchor';
+            return {
+                id: n.id,
+                label: String(n.title || n.id || '').slice(0, 38),
+                title: `${n.title || n.id}${n.published ? `\n${String(n.published).slice(0, 10)}` : ''}`,
+                shape: 'dot',
+                size: anchor ? 24 : 16,
+                color: anchor
+                    ? { background: '#f59e0b', border: '#fef3c7' }
+                    : { background: '#38bdf8', border: '#bae6fd' },
+                font: { color: '#e2e8f0', size: 12 },
+            };
+        }));
+        const edges = new vis.DataSet(edgesData.map((e) => {
+            const score = Number(e.score || 0);
+            return {
+                from: e.from,
+                to: e.to,
+                label: Number.isFinite(score) ? score.toFixed(2) : '',
+                width: 1 + Math.max(0, score * 5),
+                color: { color: 'rgba(148,163,184,0.45)' },
+                smooth: { type: 'dynamic' },
+            };
+        }));
+
+        if (container) container.innerHTML = '';
+        if (relatedGraphNetwork && typeof relatedGraphNetwork.destroy === 'function') {
+            relatedGraphNetwork.destroy();
+        }
+        relatedGraphNetwork = new vis.Network(container, { nodes, edges }, {
+            physics: {
+                stabilization: false,
+                barnesHut: { gravitationalConstant: -2300, springLength: 160, springConstant: 0.05 },
+            },
+            interaction: { hover: true },
+        });
+        relatedGraphNetwork.on('doubleClick', (params) => {
+            if (!params.nodes || !params.nodes.length) return;
+            const pid = params.nodes[0];
+            if (pid) openReadingModal(pid);
+        });
+    } catch (e) {
+        if (meta) meta.textContent = `Failed: ${e.message}`;
+        if (container) container.innerHTML = `<div style="color:var(--danger); text-align:center; margin-top:35%;">${escapeHtml(e.message)}</div>`;
+    }
 };
 
 
@@ -8764,21 +9250,30 @@ window.runDiscovery = async () => {
         data.papers.forEach(p => {
             const card = document.createElement('div');
             card.className = 'paper-card';
+            const reasons = Array.isArray(p.recommendation_reasons) ? p.recommendation_reasons : [];
+            const queryHits = Array.isArray(p.discovery_queries) ? p.discovery_queries : [];
+            const authors = Array.isArray(p.authors) ? p.authors : [];
+            const recommendationScore = Number(p.recommendation_score || 0);
 
             // Simplified Card for Discovery
             card.innerHTML = `
                 <div class="score-badge" style="background: rgba(250, 204, 21, 0.2); color: #facc15;">Discovery</div>
-                <div class="paper-title" onclick="openLink('${p.pdf_url}')">${p.title}</div>
+                <div class="paper-title" onclick="openLink(decodeURIComponent('${encodeURIComponent(String(p.pdf_url || ''))}'))">${escapeHtml(String(p.title || 'Untitled'))}</div>
                 <div class="paper-meta">
-                    ${p.authors.slice(0, 3).join(', ')} • ${p.published.substring(0, 10)}
+                    ${escapeHtml(authors.slice(0, 3).join(', '))} • ${escapeHtml(String(p.published || '').substring(0, 10))}
                 </div>
-                <div class="paper-summary" style="-webkit-line-clamp: 3;">${p.summary}</div>
+                <div style="display:flex; gap:0.4rem; flex-wrap:wrap; margin:0.35rem 0 0.2rem;">
+                    <span class="tag" style="background:rgba(250,204,21,0.14); color:#fde68a;">score ${recommendationScore.toFixed(2)}</span>
+                    ${queryHits.slice(0, 2).map((q) => `<span class="tag" style="background:rgba(56,189,248,0.14); color:#7dd3fc;">${escapeHtml(String(q).slice(0, 30))}</span>`).join('')}
+                </div>
+                <div class="paper-summary" style="-webkit-line-clamp: 3;">${escapeHtml(String(p.summary || ''))}</div>
+                ${reasons.length ? `<ul style="margin:0.45rem 0 0.1rem 1.1rem; color:var(--text-muted); font-size:0.84rem;">${reasons.slice(0, 3).map((r) => `<li>${escapeHtml(String(r))}</li>`).join('')}</ul>` : ''}
                 <div class="card-actions">
-                    <a href="${p.pdf_url}" target="_blank" class="pdf-link"><i class="fa-regular fa-file-pdf"></i> PDF</a>
-                    <button class="action-btn" onclick="fetchAndSave('${p.id}')" title="Add to Library">
+                    <a href="${escapeHtml(String(p.pdf_url || ''))}" target="_blank" class="pdf-link"><i class="fa-regular fa-file-pdf"></i> PDF</a>
+                    <button class="action-btn" onclick="fetchAndSave(decodeURIComponent('${encodeURIComponent(String(p.id || ''))}'))" title="Add to Library">
                         <i class="fa-solid fa-plus"></i> Add
                     </button>
-                    <a href="https://arxiv.org/abs/${p.id.split('v')[0]}" target="_blank" class="code-link" style="margin-left:auto;">ArXiv Page</a>
+                    <a href="https://arxiv.org/abs/${encodeURIComponent(String((p.id || '').split('v')[0] || ''))}" target="_blank" class="code-link" style="margin-left:auto;">ArXiv Page</a>
                 </div>
              `;
             resultsEl.appendChild(card);
@@ -8817,9 +9312,11 @@ window.updateSelectionUI = () => {
     const battleBtn = document.getElementById('battleBtn');
     const matrixBtn = document.getElementById('matrixBtn');
     const compareDiffBtn = document.getElementById('compareDiffBtn');
+    const crossPaperQaBtn = document.getElementById('crossPaperQaBtn');
     const benchmarkBtn = document.getElementById('benchmarkBtn');
     const batchTagBtn = document.getElementById('batchTagBtn');
     const citationOverlayBtn = document.getElementById('citationOverlayBtn');
+    const relatedGraphBtn = document.getElementById('relatedGraphBtn');
 
     if (count > 0) {
         bar.classList.remove('hidden');
@@ -8835,6 +9332,9 @@ window.updateSelectionUI = () => {
 
         if (compareDiffBtn) {
             compareDiffBtn.style.display = count === 2 ? 'block' : 'none';
+        }
+        if (crossPaperQaBtn) {
+            crossPaperQaBtn.style.display = count >= 2 ? 'block' : 'none';
         }
 
         // Matrix supports 2..6 papers
@@ -8853,14 +9353,19 @@ window.updateSelectionUI = () => {
         if (citationOverlayBtn) {
             citationOverlayBtn.style.display = count >= 2 ? 'block' : 'none';
         }
+        if (relatedGraphBtn) {
+            relatedGraphBtn.style.display = count >= 1 ? 'block' : 'none';
+        }
     } else {
         bar.classList.add('hidden');
         battleBtn.style.display = 'none';
         matrixBtn.style.display = 'none';
         if (compareDiffBtn) compareDiffBtn.style.display = 'none';
+        if (crossPaperQaBtn) crossPaperQaBtn.style.display = 'none';
         benchmarkBtn.style.display = 'none';
         if (batchTagBtn) batchTagBtn.style.display = 'none';
         if (citationOverlayBtn) citationOverlayBtn.style.display = 'none';
+        if (relatedGraphBtn) relatedGraphBtn.style.display = 'none';
     }
 };
 
@@ -8871,6 +9376,92 @@ window.updateSelectionUI = () => {
 // Javascript allows overwriting. If we define `window.updateSelectionUI` here, it should work IF the original was also assigned to window or if we replace the function definition.
 // Wait, `toggleSelectionMode` calls `updateSelectionUI`.
 // Let's modify the ORIGINAL updateSelectionUI to insert the battle logic.
+
+window.openCrossPaperQaModal = () => {
+    const count = selectedPaperIds.size;
+    if (count < 2) {
+        alert("Select at least 2 papers first.");
+        return;
+    }
+    showModal('crossPaperQaModal');
+    const questionInput = document.getElementById('crossPaperQaQuestionInput');
+    if (questionInput && !questionInput.value.trim()) {
+        questionInput.value = 'What are the main method differences and trade-offs across these papers?';
+    }
+    const metaEl = document.getElementById('crossPaperQaMeta');
+    if (metaEl) metaEl.textContent = `${count} selected papers ready.`;
+    const answerEl = document.getElementById('crossPaperQaAnswer');
+    if (answerEl) answerEl.textContent = 'No answer yet.';
+    const sourcesEl = document.getElementById('crossPaperQaSources');
+    if (sourcesEl) sourcesEl.innerHTML = '';
+};
+
+window.closeCrossPaperQaModal = () => {
+    hideModal('crossPaperQaModal');
+};
+
+window.runCrossPaperQa = async () => {
+    const questionInput = document.getElementById('crossPaperQaQuestionInput');
+    const topKInput = document.getElementById('crossPaperQaTopKInput');
+    const metaEl = document.getElementById('crossPaperQaMeta');
+    const answerEl = document.getElementById('crossPaperQaAnswer');
+    const sourcesEl = document.getElementById('crossPaperQaSources');
+    const question = (questionInput?.value || '').trim();
+    const topKRaw = Number(topKInput?.value || 5);
+    const topK = Number.isFinite(topKRaw) ? Math.max(1, Math.min(12, Math.round(topKRaw))) : 5;
+    const paperIds = Array.from(selectedPaperIds);
+    if (paperIds.length < 2) {
+        alert("Select at least 2 papers.");
+        return;
+    }
+    if (!question) {
+        alert("Enter a question.");
+        return;
+    }
+
+    if (metaEl) metaEl.textContent = `Asking across ${paperIds.length} papers...`;
+    if (answerEl) answerEl.innerHTML = '<div class="loader"></div>';
+    if (sourcesEl) sourcesEl.innerHTML = '';
+
+    try {
+        const res = await fetch(`${API_BASE}/cross-paper-qa`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paper_ids: paperIds, question, top_k: topK })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Cross-paper QA failed");
+        await ensureMarkdownLibs();
+        if (answerEl) {
+            answerEl.innerHTML = renderMarkdownSafe(data.answer || "No answer generated.");
+        }
+        if (metaEl) {
+            metaEl.textContent = `${Number(data.count_selected || paperIds.length)} papers · ${Number(data.count_sources || 0)} sources${data.cached ? ' · cached' : ''}`;
+        }
+        const sources = Array.isArray(data.sources) ? data.sources : [];
+        if (sourcesEl) {
+            if (!sources.length) {
+                sourcesEl.innerHTML = '<div style="color:var(--text-muted);">No source snippets returned.</div>';
+            } else {
+                sourcesEl.innerHTML = sources.map((s) => `
+                    <div style="border:1px solid rgba(255,255,255,0.12); border-radius:9px; padding:0.65rem; background:rgba(255,255,255,0.03);">
+                        <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:flex-start;">
+                            <div style="font-weight:600;">[${escapeHtml(String(s.tag || 'S'))}] ${escapeHtml(String(s.title || s.paper_id || 'Paper'))}</div>
+                            <div style="font-size:0.78rem; color:var(--text-muted);">score ${Number(s.relevance_score || 0).toFixed(2)}</div>
+                        </div>
+                        <div style="font-size:0.84rem; color:var(--text-muted); margin-top:0.28rem;">
+                            ${escapeHtml(String(s.published || '').slice(0, 10))} · <code>${escapeHtml(String(s.paper_id || ''))}</code>
+                        </div>
+                        <div style="margin-top:0.35rem;">${escapeHtml(String(s.snippet || ''))}</div>
+                    </div>
+                `).join('');
+            }
+        }
+    } catch (e) {
+        if (metaEl) metaEl.textContent = `Failed: ${e.message}`;
+        if (answerEl) answerEl.innerHTML = `<div style="color:var(--danger)">Failed to run QA: ${escapeHtml(e.message)}</div>`;
+    }
+};
 
 window.startBattle = async () => {
     const paperIds = Array.from(selectedPaperIds);
@@ -9567,36 +10158,100 @@ window.openConceptMap = async () => {
 };
 
 // --- Smart Folders Logic ---
+function resetFolderModalForm() {
+    const title = document.getElementById('folderModalTitle');
+    const submitBtn = document.getElementById('folderSubmitBtn');
+    const nameInput = document.getElementById('folderNameInput');
+    const queryInput = document.getElementById('folderQueryInput');
+    const descInput = document.getElementById('folderDescriptionInput');
+    const goalInput = document.getElementById('folderGoalInput');
+    const targetInput = document.getElementById('folderTargetCountInput');
+    const statusInput = document.getElementById('folderStatusInput');
+    if (title) title.textContent = 'New Smart Collection';
+    if (submitBtn) submitBtn.textContent = 'Create Collection';
+    if (nameInput) nameInput.value = '';
+    if (queryInput) queryInput.value = '';
+    if (descInput) descInput.value = '';
+    if (goalInput) goalInput.value = '';
+    if (targetInput) targetInput.value = '0';
+    if (statusInput) statusInput.value = 'active';
+}
+
 window.openCreateFolderModal = () => {
+    activeFolderEditor = null;
+    resetFolderModalForm();
+    showModal('createFolderModal');
+};
+
+window.openEditFolderModal = (folder) => {
+    if (!folder || !folder.id) return;
+    activeFolderEditor = { id: String(folder.id) };
+    const title = document.getElementById('folderModalTitle');
+    const submitBtn = document.getElementById('folderSubmitBtn');
+    const nameInput = document.getElementById('folderNameInput');
+    const queryInput = document.getElementById('folderQueryInput');
+    const descInput = document.getElementById('folderDescriptionInput');
+    const goalInput = document.getElementById('folderGoalInput');
+    const targetInput = document.getElementById('folderTargetCountInput');
+    const statusInput = document.getElementById('folderStatusInput');
+    if (title) title.textContent = 'Edit Collection';
+    if (submitBtn) submitBtn.textContent = 'Save Collection';
+    if (nameInput) nameInput.value = String(folder.name || '');
+    if (queryInput) queryInput.value = String(folder.query || '');
+    if (descInput) descInput.value = String(folder.description || '');
+    if (goalInput) goalInput.value = String(folder.goal || '');
+    if (targetInput) targetInput.value = String(Number(folder.target_count || 0));
+    if (statusInput) statusInput.value = String(folder.status || 'active');
     showModal('createFolderModal');
 };
 
 window.closeCreateFolderModal = () => {
     hideModal('createFolderModal');
+    activeFolderEditor = null;
+    resetFolderModalForm();
 };
 
 window.createSmartFolder = async () => {
     const name = document.getElementById('folderNameInput').value.trim();
     const query = document.getElementById('folderQueryInput').value.trim();
+    const description = document.getElementById('folderDescriptionInput')?.value?.trim() || '';
+    const goal = document.getElementById('folderGoalInput')?.value?.trim() || '';
+    const targetCountRaw = Number(document.getElementById('folderTargetCountInput')?.value || 0);
+    const statusRaw = String(document.getElementById('folderStatusInput')?.value || 'active').toLowerCase();
+    const status = ['active', 'paused', 'archived'].includes(statusRaw) ? statusRaw : 'active';
+    const targetCount = Number.isFinite(targetCountRaw) ? Math.max(0, Math.round(targetCountRaw)) : 0;
 
     if (!name || !query) {
         alert("Please enter both a name and a search query.");
         return;
     }
 
-    try {
-        const res = await fetch(`${API_BASE}/folders`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, query })
-        });
+    const payload = {
+        name,
+        query,
+        description,
+        goal,
+        target_count: targetCount,
+        status,
+    };
 
-        if (!res.ok) throw new Error("Failed to create folder");
+    try {
+        const isEdit = Boolean(activeFolderEditor?.id);
+        const endpoint = activeFolderEditor?.id
+            ? `${API_BASE}/folders/${encodeURIComponent(activeFolderEditor.id)}`
+            : `${API_BASE}/folders`;
+        const method = isEdit ? 'PUT' : 'POST';
+        const res = await fetch(endpoint, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to save collection");
 
         closeCreateFolderModal();
-        fetchFolders(); // Refresh list
-        alert("Collection created!");
-
+        fetchFolders();
+        alert(isEdit ? "Collection updated." : "Collection created.");
     } catch (e) {
         alert(e.message);
     }
@@ -9742,7 +10397,15 @@ window.fetchFolders = async () => {
 
             const btn = document.createElement('button');
             btn.className = 'filter-chip';
-            btn.innerHTML = `<i class="fa-solid fa-folder"></i> ${f.name}`;
+            const status = String(f.status || 'active').toLowerCase();
+            const statusDot = status === 'archived' ? '•' : status === 'paused' ? '◦' : '●';
+            btn.innerHTML = `<i class="fa-solid fa-folder"></i> ${f.name} <span style="opacity:0.75; font-size:0.78rem;">${statusDot}</span>`;
+            btn.title = [
+                f.description ? `Description: ${f.description}` : '',
+                f.goal ? `Goal: ${f.goal}` : '',
+                Number(f.target_count || 0) > 0 ? `Target: ${Number(f.target_count)} papers` : '',
+                `Status: ${status}`,
+            ].filter(Boolean).join('\n');
             btn.onclick = () => openFolder(f.id, btn);
             // Right click to delete
             btn.oncontextmenu = (e) => {
@@ -9774,7 +10437,19 @@ window.fetchFolders = async () => {
                 openFolderScheduleModal(f.id, f.name);
             };
 
+            const editBtn = document.createElement('button');
+            editBtn.className = 'action-btn';
+            editBtn.title = 'Edit collection metadata';
+            editBtn.innerHTML = '<i class="fa-solid fa-pen-to-square"></i>';
+            editBtn.style.padding = '0.35rem 0.55rem';
+            editBtn.style.borderRadius = '999px';
+            editBtn.onclick = (e) => {
+                e.stopPropagation();
+                openEditFolderModal(f);
+            };
+
             wrapper.appendChild(btn);
+            wrapper.appendChild(editBtn);
             wrapper.appendChild(scheduleBtn);
             wrapper.appendChild(shareBtn);
             container.appendChild(wrapper);
