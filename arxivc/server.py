@@ -24,6 +24,7 @@ import sqlite3
 import requests
 from . import client, storage, ranker, downloader, config, indexer, ai_service, citation_service, embeddings, export_service, pdf_service, agent_service
 from .ai_service import extract_text_from_pdf, simple_chat_logic, generate_brief, describe_image
+from .routers.read_ops import create_read_ops_router
 
 app = FastAPI()
 
@@ -4702,6 +4703,30 @@ def enrich_citations(paper_ids: List[str]):
         generate_alerts_for_papers(papers)
         print(f"Updated citations for {len(counts)} papers.")
 
+def _get_fetch_pipeline_state() -> Dict[str, Any]:
+    with _FETCH_PIPELINE_LOCK:
+        return {
+            "active": bool(_FETCH_PIPELINE_ACTIVE),
+            "tasks": int(_FETCH_PIPELINE_TASKS or 0),
+            "started_at": _FETCH_PIPELINE_STARTED_AT,
+        }
+
+app.include_router(
+    create_read_ops_router(
+        storage=storage,
+        api_cache_get=_api_cache_get,
+        api_cache_set=_api_cache_set,
+        scheduler_leader_payload=_get_scheduler_leader_payload,
+        scheduler_agent_ops=_build_scheduler_agent_ops,
+        job_queue_ops=_build_job_queue_ops,
+        parse_iso_datetime=_parse_iso_datetime,
+        job_lock=_JOB_LOCK,
+        jobs_ref=_JOBS,
+        job_queue=_JOB_QUEUE,
+        fetch_pipeline_state=_get_fetch_pipeline_state,
+    )
+)
+
 @app.post("/api/fetch")
 def api_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
     storage.init_db()
@@ -5165,11 +5190,6 @@ def retry_day_run(run_id: int):
     response["retry_of"] = int(run_id)
     return response
 
-@app.get("/api/daily-fetch/runs")
-def list_daily_fetch_runs(limit: int = 30, date_from: Optional[str] = None, date_to: Optional[str] = None):
-    storage.init_db()
-    return storage.list_daily_fetch_runs(limit=limit, date_from=date_from, date_to=date_to)
-
 @app.get("/api/papers")
 def get_papers(
     status: str = 'new',
@@ -5626,26 +5646,6 @@ def run_saved_search_agent(agent_id: int):
     if not agent:
         raise HTTPException(status_code=404, detail="Saved search agent not found.")
     return _run_saved_search_agent(agent, trigger="manual")
-
-@app.get("/api/system/scheduler-leader")
-def get_scheduler_leader():
-    """
-    Debug endpoint: returns current scheduler leader lock state.
-    Useful when running multiple API workers/processes.
-    """
-    storage.init_db()
-    return _get_scheduler_leader_payload()
-
-@app.get("/api/system/scheduler-ops")
-def get_scheduler_ops():
-    """Ops dashboard payload: leader health + due agents + queue stats."""
-    storage.init_db()
-    leader = _get_scheduler_leader_payload()
-    return {
-        "leader": leader,
-        "agents": _build_scheduler_agent_ops(),
-        "jobs": _build_job_queue_ops(),
-    }
 
 @app.get("/api/digest/runs")
 def list_digest_runs(limit: int = 20, cadence: Optional[str] = None):
@@ -7557,26 +7557,6 @@ def unfollow_author(req: AuthorRequest):
     storage.unfollow_author(req.name)
     return {"success": True}
 
-@app.get("/api/stats")
-def get_stats():
-    storage.init_db()
-    cached = _api_cache_get("stats", ttl_seconds=60, epoch_key="stats")
-    if cached is not None:
-        return cached
-    data = storage.get_daily_stats()
-    _api_cache_set("stats", data, epoch_key="stats")
-    return data
-
-@app.get("/api/graph")
-async def get_graph():
-    storage.init_db()
-    cached = _api_cache_get("graph", ttl_seconds=60, epoch_key="graph")
-    if cached is not None:
-        return cached
-    data = storage.get_graph_data()
-    _api_cache_set("graph", data, epoch_key="graph")
-    return data
-
 @app.post("/api/citations/links")
 def get_citation_links(req: CitationLinksRequest):
     storage.init_db()
@@ -9105,49 +9085,6 @@ def get_agent_status(job_id: str):
         "result": agent.result,
         "papers_found": len(agent.findings)
     }
-
-@app.get("/health")
-def health():
-    db_status = storage.db_healthcheck()
-    embedding_status = storage.get_embedding_status()
-    fts_status = storage.get_fts_status()
-    with _JOB_LOCK:
-        jobs = list(_JOBS.values())
-    queued = sum(1 for j in jobs if j.get("status") == "queued")
-    running = sum(1 for j in jobs if j.get("status") == "running")
-    failed = sum(1 for j in jobs if j.get("status") == "failed")
-    completed = sum(1 for j in jobs if j.get("status") == "completed")
-    payload = {
-        "status": "ok" if db_status.get("ok") else "degraded",
-        "db": db_status,
-        "embeddings": embedding_status,
-        "fts": fts_status,
-        "jobs": {
-            "queued": queued,
-            "running": running,
-            "failed": failed,
-            "completed": completed,
-            "queue_size": _JOB_QUEUE.qsize(),
-        },
-        "fetch_pipeline": {
-            "active": bool(_FETCH_PIPELINE_ACTIVE),
-            "tasks": int(_FETCH_PIPELINE_TASKS or 0),
-            "started_at": _FETCH_PIPELINE_STARTED_AT,
-        },
-    }
-    return payload
-
-@app.get("/api/changes")
-def get_change_summary(since: Optional[str] = None):
-    storage.init_db()
-    now = datetime.now()
-    since_dt = _parse_iso_datetime(since) if since else None
-    if not since_dt:
-        since_dt = now - timedelta(days=1)
-    payload = storage.get_changes_since(since_dt.isoformat())
-    payload["since"] = since_dt.isoformat()
-    payload["as_of"] = now.isoformat()
-    return payload
 
 @app.post("/api/discover")
 def discover_new_papers():
