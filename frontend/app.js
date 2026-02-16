@@ -1,23 +1,50 @@
-const API_BASE = '/api';
+const sharedState = (window.__ARXIVC_STATE__ && typeof window.__ARXIVC_STATE__ === 'object')
+    ? window.__ARXIVC_STATE__
+    : {};
+const sharedApiClient = (window.__ARXIVC_API__ && typeof window.__ARXIVC_API__ === 'object')
+    ? window.__ARXIVC_API__
+    : null;
+const API_BASE = window.API_BASE || sharedState.apiBase || '/api';
+
+function stateString(key, fallback) {
+    const value = sharedState[key];
+    return (typeof value === 'string' && value.trim()) ? value : fallback;
+}
+
+function stateBool(key, fallback) {
+    const value = sharedState[key];
+    return typeof value === 'boolean' ? value : fallback;
+}
+
+function stateNumber(key, fallback) {
+    const raw = Number(sharedState[key]);
+    return Number.isFinite(raw) ? raw : fallback;
+}
+
+function stateArray(key, fallback = []) {
+    return Array.isArray(sharedState[key]) ? [...sharedState[key]] : fallback;
+}
 
 // State
-let currentStatus = 'new';
-let isLoading = false;
-let userKeywords = [];
-let currentView = 'grid';
+let currentStatus = stateString('currentStatus', 'new');
+let isLoading = stateBool('isLoading', false);
+let userKeywords = stateArray('userKeywords');
+let currentView = stateString('currentView', 'grid');
 let focusedPaperId = null;
-let currentDateFilter = null;
+let currentDateFilter = (typeof sharedState.currentDateFilter === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(sharedState.currentDateFilter))
+    ? sharedState.currentDateFilter
+    : null;
 let feedAbortController = null;
 let feedPageAbortController = null;
 let searchAbortController = null;
 
 // Filtering & Sorting
 let allPapers = []; // Global store for client-side filtering
-let isSmartSort = false;
+let isSmartSort = stateBool('isSmartSort', false);
 let followedAuthors = new Set();
-let searchMode = 'local';
-let favoritesSort = 'ai';
-const FAVORITES_CACHE_TTL_MS = 5 * 60 * 1000;
+let searchMode = stateString('searchMode', 'local');
+let favoritesSort = stateString('favoritesSort', 'ai');
+const FAVORITES_CACHE_TTL_MS = stateNumber('favoritesCacheTtlMs', 5 * 60 * 1000);
 const favoritesCache = {};
 
 // UI State
@@ -56,7 +83,7 @@ const INDEX_STALE_COVERAGE = 0.98;
 const MENTION_HANDLE_KEY = 'arxivc.mentionHandle.v1';
 const MENTION_READ_KEY_PREFIX = 'arxivc.mentions.read.v1.';
 const RANK_PROFILE_KEY = 'arxivc.rankProfile.v1';
-const API_CACHE_MAX_ENTRIES = 80;
+const API_CACHE_MAX_ENTRIES = Math.max(1, stateNumber('apiCacheMaxEntries', 80));
 const apiResponseCache = new Map();
 /**
  * @typedef {Object} Paper
@@ -155,9 +182,19 @@ let inboxRulesAuditCache = [];
 let inboxRulesDiagnosticsCache = [];
 let mentionReadSet = new Set();
 let mentionsCache = [];
-const DEFAULT_RANK_PROFILE = { relevance: 50, novelty: 30, citations: 20 };
+const DEFAULT_RANK_PROFILE = (sharedState.defaultRankProfile && typeof sharedState.defaultRankProfile === 'object')
+    ? {
+        relevance: Number(sharedState.defaultRankProfile.relevance ?? 50),
+        novelty: Number(sharedState.defaultRankProfile.novelty ?? 30),
+        citations: Number(sharedState.defaultRankProfile.citations ?? 20),
+    }
+    : { relevance: 50, novelty: 30, citations: 20 };
 let rankProfile = { ...DEFAULT_RANK_PROFILE };
 let rankProfileRefreshTimer = null;
+let papersUiModule = null;
+let cardsUiModule = null;
+let readingPlanUiModule = null;
+let inboxUiModule = null;
 
 // Elements
 
@@ -255,7 +292,10 @@ function initializeModalUX() {
 function loadUIState() {
     try {
         const raw = localStorage.getItem(UI_STATE_KEY);
-        if (!raw) return;
+        if (!raw) {
+            syncSharedUiState();
+            return;
+        }
         const state = JSON.parse(raw);
         if (state && typeof state === 'object') {
             const allowedStatus = new Set(['new', 'liked', 'dismissed', 'bookmarked', 'read']);
@@ -275,6 +315,19 @@ function loadUIState() {
     } catch (e) {
         console.warn("Failed to load UI state", e);
     }
+    syncSharedUiState();
+}
+
+function syncSharedUiState() {
+    if (!sharedState || typeof sharedState !== 'object') return;
+    sharedState.currentStatus = currentStatus;
+    sharedState.currentDateFilter = currentDateFilter;
+    sharedState.isSmartSort = isSmartSort;
+    sharedState.currentView = currentView;
+    sharedState.searchMode = searchMode;
+    sharedState.favoritesSort = favoritesSort;
+    sharedState.isLoading = isLoading;
+    sharedState.userKeywords = Array.isArray(userKeywords) ? [...userKeywords] : [];
 }
 
 function saveUIState() {
@@ -292,6 +345,7 @@ function saveUIState() {
     } catch (e) {
         console.warn("Failed to save UI state", e);
     }
+    syncSharedUiState();
 }
 
 function applyUIStateToControls() {
@@ -463,6 +517,10 @@ window.resetRankProfile = () => {
 };
 
 function cacheApiResponse(url, payload) {
+    if (sharedApiClient && typeof sharedApiClient.cacheApiResponse === 'function') {
+        sharedApiClient.cacheApiResponse(url, payload);
+        return;
+    }
     if (!url) return;
     if (apiResponseCache.has(url)) {
         apiResponseCache.delete(url);
@@ -475,11 +533,17 @@ function cacheApiResponse(url, payload) {
 }
 
 function getCachedApiResponse(url) {
+    if (sharedApiClient && typeof sharedApiClient.getCachedApiResponse === 'function') {
+        return sharedApiClient.getCachedApiResponse(url);
+    }
     const entry = apiResponseCache.get(url);
     return entry ? entry.payload : null;
 }
 
 async function fetchJsonWithCache(url, options = {}) {
+    if (sharedApiClient && typeof sharedApiClient.fetchJsonWithCache === 'function') {
+        return sharedApiClient.fetchJsonWithCache(url, options);
+    }
     const headers = new Headers(options.headers || {});
     if (apiResponseCache.has(url)) {
         headers.set('X-Client-Cache', 'warm');
@@ -530,6 +594,9 @@ async function fetchJsonWithCache(url, options = {}) {
 }
 
 async function apiFetchJson(url, { method = 'GET', body = null, useCache = true, signal = undefined } = {}) {
+    if (sharedApiClient && typeof sharedApiClient.fetchJson === 'function') {
+        return sharedApiClient.fetchJson(url, { method, body, useCache, signal });
+    }
     const opts = { method, signal };
     if (body !== null) {
         opts.headers = { 'Content-Type': 'application/json' };
@@ -629,16 +696,9 @@ window.toggleThreadsView = () => {
 };
 
 function updateFavoritesSortBar() {
-    const bar = document.getElementById('favoritesSortBar');
-    if (!bar) return;
-    if (currentStatus === 'liked') {
-        bar.classList.remove('hidden');
-    } else {
-        bar.classList.add('hidden');
+    if (papersUiModule && typeof papersUiModule.updateFavoritesSortBar === 'function') {
+        papersUiModule.updateFavoritesSortBar();
     }
-    document.querySelectorAll('.fav-sort-chip').forEach((chip) => {
-        chip.classList.toggle('active', chip.dataset.sort === favoritesSort);
-    });
 }
 
 function initTrail() {
@@ -775,31 +835,17 @@ function runCompareFromTrail(paperIds, mode) {
 }
 
 function computeMatchScore(paper) {
-    if (!paper) return 0;
-    if (paper.match_score !== undefined && paper.match_score !== null) {
-        return Number(paper.match_score) || 0;
+    if (papersUiModule && typeof papersUiModule.computeMatchScore === 'function') {
+        return papersUiModule.computeMatchScore(paper);
     }
-    const text = `${paper.title || ''} ${paper.summary || ''}`.toLowerCase();
-    let score = 0;
-    (userKeywords || []).forEach((kw) => {
-        const k = String(kw || '').toLowerCase().trim();
-        if (k && text.includes(k)) score += 1;
-    });
-    return score;
+    return Number(paper && paper.match_score ? paper.match_score : 0) || 0;
 }
 
 function applyFavoritesSort(papers) {
-    if (!Array.isArray(papers)) return papers;
-    const sorted = papers.slice();
-    if (favoritesSort === 'date') {
-        sorted.sort((a, b) => String(b.published || '').localeCompare(String(a.published || '')));
-    } else if (favoritesSort === 'matches') {
-        sorted.forEach((p) => { p.match_score = computeMatchScore(p); });
-        sorted.sort((a, b) => (b.match_score || 0) - (a.match_score || 0));
-    } else if (favoritesSort === 'novelty') {
-        sorted.sort((a, b) => (b.novelty_score || 0) - (a.novelty_score || 0));
+    if (papersUiModule && typeof papersUiModule.applyFavoritesSort === 'function') {
+        return papersUiModule.applyFavoritesSort(papers);
     }
-    return sorted;
+    return Array.isArray(papers) ? papers : [];
 }
 
 function updatePaperLocal(paperId, updates) {
@@ -1979,12 +2025,210 @@ let activeSearchQuery = '';
 let activeSearchMode = 'local';
 let scrollRafId = null;
 
+function getPapersModuleState() {
+    return {
+        apiBase: API_BASE,
+        currentStatus,
+        currentView,
+        isSmartSort,
+        favoritesSort,
+        currentDateFilter,
+        userKeywords,
+        allPapers,
+        currentVisiblePapers,
+        feedOffset,
+        feedHasMore,
+        feedLoadingMore,
+        feedRequestToken,
+        feedAbortController,
+        feedPageAbortController,
+        feedPageSize: FEED_PAGE_SIZE,
+    };
+}
+
+function setPapersModuleState(patch = {}) {
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentStatus')) currentStatus = patch.currentStatus;
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentView')) currentView = patch.currentView;
+    if (Object.prototype.hasOwnProperty.call(patch, 'isSmartSort')) isSmartSort = Boolean(patch.isSmartSort);
+    if (Object.prototype.hasOwnProperty.call(patch, 'favoritesSort')) favoritesSort = patch.favoritesSort;
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentDateFilter')) currentDateFilter = patch.currentDateFilter;
+    if (Object.prototype.hasOwnProperty.call(patch, 'userKeywords')) userKeywords = Array.isArray(patch.userKeywords) ? patch.userKeywords : userKeywords;
+    if (Object.prototype.hasOwnProperty.call(patch, 'allPapers')) allPapers = Array.isArray(patch.allPapers) ? patch.allPapers : allPapers;
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentVisiblePapers')) currentVisiblePapers = Array.isArray(patch.currentVisiblePapers) ? patch.currentVisiblePapers : currentVisiblePapers;
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedOffset')) feedOffset = Number(patch.feedOffset || 0);
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedHasMore')) feedHasMore = Boolean(patch.feedHasMore);
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedLoadingMore')) feedLoadingMore = Boolean(patch.feedLoadingMore);
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedRequestToken')) feedRequestToken = Number(patch.feedRequestToken || 0);
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedAbortController')) feedAbortController = patch.feedAbortController || null;
+    if (Object.prototype.hasOwnProperty.call(patch, 'feedPageAbortController')) feedPageAbortController = patch.feedPageAbortController || null;
+    if (Object.prototype.hasOwnProperty.call(patch, 'isLoading')) isLoading = Boolean(patch.isLoading);
+    syncSharedUiState();
+}
+
+function getReadingPlanModuleState() {
+    return {
+        apiBase: API_BASE,
+        allPapers,
+        currentVisiblePapers,
+        activeReadingPaperId,
+        activeReadingStatus,
+        activeReadingPlanPayload,
+        lastReadingPlanAction,
+    };
+}
+
+function setReadingPlanModuleState(patch = {}) {
+    if (Object.prototype.hasOwnProperty.call(patch, 'allPapers')) {
+        allPapers = Array.isArray(patch.allPapers) ? patch.allPapers : allPapers;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentVisiblePapers')) {
+        currentVisiblePapers = Array.isArray(patch.currentVisiblePapers) ? patch.currentVisiblePapers : currentVisiblePapers;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'activeReadingPaperId')) {
+        activeReadingPaperId = patch.activeReadingPaperId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'activeReadingStatus')) {
+        activeReadingStatus = String(patch.activeReadingStatus || 'queue');
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'activeReadingPlanPayload')) {
+        activeReadingPlanPayload = patch.activeReadingPlanPayload || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastReadingPlanAction')) {
+        lastReadingPlanAction = patch.lastReadingPlanAction || null;
+    }
+}
+
+function getInboxModuleState() {
+    return {
+        apiBase: API_BASE,
+        currentStatus,
+        currentDateFilter,
+        unifiedInboxState,
+        unifiedInboxSelectedItems,
+        unifiedInboxVisibleItems,
+        dayRunHistoryCache,
+        dayRunPresetsCache,
+    };
+}
+
+function setInboxModuleState(patch = {}) {
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentStatus')) {
+        currentStatus = patch.currentStatus || currentStatus;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'currentDateFilter')) {
+        currentDateFilter = patch.currentDateFilter || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'unifiedInboxState')) {
+        unifiedInboxState = (patch.unifiedInboxState && typeof patch.unifiedInboxState === 'object')
+            ? patch.unifiedInboxState
+            : unifiedInboxState;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'unifiedInboxSelectedItems')) {
+        unifiedInboxSelectedItems = (patch.unifiedInboxSelectedItems instanceof Map)
+            ? patch.unifiedInboxSelectedItems
+            : new Map();
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'unifiedInboxVisibleItems')) {
+        unifiedInboxVisibleItems = Array.isArray(patch.unifiedInboxVisibleItems)
+            ? patch.unifiedInboxVisibleItems
+            : [];
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'dayRunHistoryCache')) {
+        dayRunHistoryCache = Array.isArray(patch.dayRunHistoryCache) ? patch.dayRunHistoryCache : [];
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'dayRunPresetsCache')) {
+        dayRunPresetsCache = Array.isArray(patch.dayRunPresetsCache) ? patch.dayRunPresetsCache : [];
+    }
+    syncSharedUiState();
+}
+
+if (window.ArxivPulsePapers && typeof window.ArxivPulsePapers.create === 'function') {
+    papersUiModule = window.ArxivPulsePapers.create({
+        getState: getPapersModuleState,
+        setState: setPapersModuleState,
+        documentRef: document,
+        windowRef: window,
+        hasActiveSearchQuery,
+        saveUIState,
+        applySkimViewState,
+        applyThreadsViewState,
+        disconnectFeedObserver,
+        resetVirtualization,
+        setLoading,
+        getPaperGrid: () => paperGrid,
+        getFavoritesCacheEntry,
+        setFavoritesCache,
+        fetchJsonWithCache,
+        getRankProfileQuery,
+        renderPaperGrid: (...args) => renderPaperGrid(...args),
+        hideFeedSentinel,
+        setupFeedObserver,
+        updateFeedSentinel,
+        alertUser: (message) => alert(message),
+    });
+}
+
+if (window.ArxivPulseCards && typeof window.ArxivPulseCards.create === 'function') {
+    cardsUiModule = window.ArxivPulseCards.create({
+        getState: getPapersModuleState,
+        setState: setPapersModuleState,
+        fetchImpl: window.fetch.bind(window),
+        invalidateFavoritesCache,
+        renderPaperGrid: (...args) => renderPaperGrid(...args),
+        refreshAllBadges: (...args) => refreshAllBadges(...args),
+        getPaperGrid: () => paperGrid,
+        alertUser: (message) => alert(message),
+    });
+}
+
+if (window.ArxivPulseReadingPlan && typeof window.ArxivPulseReadingPlan.create === 'function') {
+    readingPlanUiModule = window.ArxivPulseReadingPlan.create({
+        getState: getReadingPlanModuleState,
+        setState: setReadingPlanModuleState,
+        documentRef: document,
+        windowRef: window,
+        fetchImpl: window.fetch.bind(window),
+        showModal,
+        hideModal,
+        recordTrail,
+        getPaperTitleById,
+        escapeHtml,
+        updatePaperLocal,
+        renderPaperGrid: (...args) => renderPaperGrid(...args),
+        alertUser: (message) => alert(message),
+    });
+}
+
+if (window.ArxivPulseInbox && typeof window.ArxivPulseInbox.create === 'function') {
+    inboxUiModule = window.ArxivPulseInbox.create({
+        getState: getInboxModuleState,
+        setState: setInboxModuleState,
+        documentRef: document,
+        windowRef: window,
+        fetchImpl: window.fetch.bind(window),
+        apiFetchJson: (...args) => apiFetchJson(...args),
+        showModal,
+        hideModal,
+        recordTrail,
+        loadPapers: () => loadPapers(),
+        saveUIState,
+        refreshAllBadges: (...args) => refreshAllBadges(...args),
+        refreshUnifiedInboxBadge: () => refreshUnifiedInboxBadge(),
+        escapeHtml,
+        formatIsoShort,
+        alertUser: (message) => alert(message),
+    });
+}
+
 function hasActiveSearchQuery() {
     const input = document.getElementById('searchInput');
     return Boolean(input && input.value && input.value.trim().length > 0);
 }
 
 function shouldUsePagedFeed() {
+    if (papersUiModule && typeof papersUiModule.shouldUsePagedFeed === 'function') {
+        return papersUiModule.shouldUsePagedFeed();
+    }
     if (hasActiveSearchQuery()) return false;
     if (currentStatus === 'liked') {
         return favoritesSort !== 'ai';
@@ -2108,61 +2352,8 @@ window.scrollToTop = () => {
 };
 
 async function loadNextPaperPage() {
-    if (!shouldUsePagedFeed() || feedLoadingMore || !feedHasMore) return;
-    const requestToken = feedRequestToken;
-    feedLoadingMore = true;
-    updateFeedSentinel();
-    if (feedPageAbortController) {
-        feedPageAbortController.abort();
-    }
-    feedPageAbortController = new AbortController();
-
-    try {
-        const allowSmartSort = isSmartSort && !(currentStatus === 'liked' && favoritesSort !== 'ai');
-        const includeNovelty = (currentStatus === 'liked' && favoritesSort === 'novelty') || feedOffset === 0;
-        let url = `${API_BASE}/papers?status=${currentStatus}&limit=${FEED_PAGE_SIZE}&offset=${feedOffset}&include_meta=true&include_novelty=${includeNovelty ? 'true' : 'false'}`;
-        if (currentDateFilter) {
-            url += `&date=${currentDateFilter}`;
-        }
-        if (allowSmartSort) {
-            url += `&sort=smart`;
-        } else if (currentStatus === 'liked') {
-            if (favoritesSort === 'ai') {
-                url += `&sort=smart`;
-            } else if (favoritesSort) {
-                url += `&sort=${encodeURIComponent(favoritesSort)}`;
-            }
-        }
-        url += getRankProfileQuery();
-
-        const { data: payload } = await fetchJsonWithCache(url, { signal: feedPageAbortController.signal });
-        if (requestToken !== feedRequestToken) return;
-
-        const pageItems = Array.isArray(payload.items) ? payload.items : [];
-        const isFirstPage = feedOffset === 0;
-        feedOffset += pageItems.length;
-        feedHasMore = Boolean(payload.has_more);
-
-        if (isFirstPage) {
-            allPapers = pageItems;
-            renderPaperGrid(allPapers);
-        } else if (pageItems.length > 0) {
-            allPapers = allPapers.concat(pageItems);
-            renderPaperGrid(pageItems, { append: true });
-        }
-    } catch (err) {
-        if (err && err.name === 'AbortError') {
-            return;
-        }
-        console.error("Failed to load next page", err);
-        if (requestToken === feedRequestToken) {
-            alert("Failed to load more papers.");
-        }
-    } finally {
-        if (requestToken === feedRequestToken) {
-            feedLoadingMore = false;
-            updateFeedSentinel();
-        }
+    if (papersUiModule && typeof papersUiModule.loadNextPaperPage === 'function') {
+        return papersUiModule.loadNextPaperPage();
     }
 }
 
@@ -2228,130 +2419,14 @@ async function loadNextSearchPage(token, initial) {
 
 // Navigation Logic
 function setFilter(status) {
-    currentStatus = status;
-    currentView = (currentView === 'skim' || currentView === 'threads') ? currentView : 'grid';
-
-    // Update Sidebar UI
-    const navItems = document.querySelectorAll('.nav-item');
-    navItems.forEach(item => {
-        if (item.getAttribute('onclick') && item.getAttribute('onclick').includes(status)) {
-            item.classList.add('active');
-        } else {
-            item.classList.remove('active');
-        }
-    });
-
-    // Ensure we are in Grid View
-    document.getElementById('graphView').classList.add('hidden');
-    document.getElementById('paperGrid').classList.remove('hidden');
-    document.getElementById('graphTabBtn').classList.remove('active');
-
-    // Also update top filter chips if they exist (though we are moving to sidebar)
-    const filterChips = document.querySelectorAll('.filter-chip');
-    filterChips.forEach(c => {
-        if (c.dataset.status === status) c.classList.add('active');
-        else c.classList.remove('active');
-    });
-
-    updateFavoritesSortBar();
-    saveUIState();
-    applySkimViewState();
-    applyThreadsViewState();
-    loadPapers();
+    if (papersUiModule && typeof papersUiModule.setFilter === 'function') {
+        return papersUiModule.setFilter(status);
+    }
 }
 
 async function loadPapers() {
-    currentView = currentView === 'skim' ? 'skim' : 'grid';
-    saveUIState();
-    feedRequestToken += 1;
-    feedOffset = 0;
-    feedHasMore = false;
-    feedLoadingMore = false;
-    disconnectFeedObserver();
-    resetVirtualization();
-    setLoading(true);
-    paperGrid.innerHTML = '';
-    if (feedAbortController) {
-        feedAbortController.abort();
-    }
-    feedAbortController = new AbortController();
-
-    // Adjust Grid Layout for Favorites
-    if (currentStatus === 'liked') {
-        paperGrid.classList.add('favorites-grid');
-        // Force inline style as failsafe
-        paperGrid.style.display = 'grid'; // Ensure display is grid
-        paperGrid.style.setProperty('grid-template-columns', 'repeat(2, 1fr)', 'important');
-        paperGrid.style.gap = '1.5rem';
-        console.log("Layout: Favorites (2 columns forced)");
-    } else {
-        paperGrid.classList.remove('favorites-grid');
-        paperGrid.style.removeProperty('grid-template-columns');
-        paperGrid.style.removeProperty('border');
-    }
-
-    try {
-        updateFavoritesSortBar();
-        const searchInput = document.getElementById('searchInput');
-        const hasSearch = searchInput && searchInput.value.trim().length > 0;
-        const usePaged = shouldUsePagedFeed();
-        if (currentStatus === 'liked' && !hasSearch && !usePaged) {
-            const cached = getFavoritesCacheEntry();
-            if (cached) {
-                allPapers = cached.items;
-                renderPaperGrid(allPapers);
-                return;
-            }
-        }
-        // Update header if filtering
-        const dateDisplay = document.getElementById('batchDateDisplay');
-        if (currentDateFilter) {
-            dateDisplay.textContent = `Showing: ${currentDateFilter}`;
-            // Add a "Clear" button? For now just showing is enough.
-        } else if (allPapers.length > 0) {
-            // Maybe show range?
-        }
-        if (usePaged) {
-            feedHasMore = true;
-            await loadNextPaperPage();
-            if (feedHasMore) {
-                setupFeedObserver();
-            }
-            updateFeedSentinel();
-            return;
-        }
-
-        hideFeedSentinel();
-        const allowSmartSort = isSmartSort && !(currentStatus === 'liked' && favoritesSort !== 'ai');
-        let url = `${API_BASE}/papers?status=${currentStatus}&limit=100`;
-        if (currentDateFilter) {
-            url += `&date=${currentDateFilter}`;
-        }
-        if (allowSmartSort) {
-            url += `&sort=smart`;
-        } else if (currentStatus === 'liked') {
-            if (favoritesSort === 'ai') {
-                url += `&sort=smart`;
-            } else {
-                url += `&sort=${encodeURIComponent(favoritesSort)}`;
-            }
-        }
-        url += getRankProfileQuery();
-
-        const { data } = await fetchJsonWithCache(url, { signal: feedAbortController.signal });
-        allPapers = data;
-        if (currentStatus === 'liked') {
-            setFavoritesCache(allPapers);
-        }
-        renderPaperGrid(allPapers);
-    } catch (err) {
-        if (err && err.name === 'AbortError') {
-            return;
-        }
-        console.error("Failed to load papers", err);
-        alert("Failed to load papers. check console/backend.");
-    } finally {
-        setLoading(false);
+    if (papersUiModule && typeof papersUiModule.loadPapers === 'function') {
+        return papersUiModule.loadPapers();
     }
 }
 
@@ -2376,50 +2451,11 @@ async function fetchFollowedAuthors() {
 }
 
 async function fetchNewPapers() {
-    fetchBtn.disabled = true;
-    fetchBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Fetching...';
-
-    const dateInput = document.getElementById('dateInput');
-    const dateVal = dateInput ? dateInput.value : null;
-
-    try {
-        const payload = { max_results: 20 };
-        if (dateVal) payload.date = dateVal;
-
-        const data = await apiFetchJson(`${API_BASE}/fetch`, { method: 'POST', body: payload, useCache: false });
-        alert(`Fetched ${data.fetched} papers from ${data.date}. ${data.new} are new.`);
-
-        // Update date display if exists, or title
-        const dateDisplay = document.getElementById('batchDateDisplay');
-        if (dateDisplay) dateDisplay.textContent = `Latest Batch: ${data.date}`;
-
-        // Reload if we are on 'new' tab
-        // Update filter to match fetched date
-        currentDateFilter = data.date;
-        saveUIState();
-
-        // Reload if we are on 'new' tab
-        if (currentStatus === 'new') loadPapers();
-        refreshAllBadges();
-    } catch (err) {
-        console.error("Fetch Error:", err);
-        const status = Number(err && err.status ? err.status : 0);
-        const retryAfter = Number(err && err.retryAfterSeconds ? err.retryAfterSeconds : 0);
-        if (status === 429) {
-            const waitLabel = retryAfter > 0 ? `${Math.ceil(retryAfter)}s` : 'a short wait';
-            alert(`arXiv rate limit reached. Please retry in ${waitLabel}.`);
-            return;
-        }
-        if (status === 409) {
-            alert((err && err.message) ? err.message : "Fetch already in progress. Please wait a moment and retry.");
-            return;
-        }
-        alert("Error fetching papers: " + (err.message || str(err)) + "\nCheck logs.");
-    } finally {
-        fetchBtn.disabled = false;
-        fetchBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Fetch New';
+    if (inboxUiModule && typeof inboxUiModule.fetchNewPapers === 'function') {
+        return inboxUiModule.fetchNewPapers();
     }
 }
+window.fetchNewPapers = fetchNewPapers;
 
 
 
@@ -3162,53 +3198,8 @@ function createPaperCard(paper) {
 }
 
 window.handleRate = async (id, status, btnElement) => {
-    try {
-        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(id)}/rate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status })
-        });
-
-        if (!res.ok) throw new Error("API Error");
-
-        const keepCardInCurrentFeed = (
-            status === 'liked' && (currentStatus === 'new' || currentStatus === 'bookmarked')
-        );
-        const card = btnElement.closest('.paper-card');
-        if (keepCardInCurrentFeed) {
-            allPapers = allPapers.map((p) => (p.id === id ? { ...p, status: 'liked' } : p));
-            currentVisiblePapers = currentVisiblePapers.map((p) => (p.id === id ? { ...p, status: 'liked' } : p));
-            invalidateFavoritesCache();
-            renderPaperGrid(currentVisiblePapers);
-            refreshAllBadges({ force: true });
-            return;
-        }
-
-        allPapers = allPapers.filter((p) => p.id !== id);
-        currentVisiblePapers = currentVisiblePapers.filter((p) => p.id !== id);
-        invalidateFavoritesCache();
-
-        if (virtualState.enabled) {
-            renderPaperGrid(currentVisiblePapers);
-            refreshAllBadges({ force: true });
-            return;
-        }
-
-        // Animate out when the target feed should no longer contain this item.
-        card.style.transform = 'scale(0.95)';
-        card.style.opacity = '0';
-        setTimeout(() => {
-            card.remove();
-            // If grid is empty, show message
-            if (paperGrid.querySelectorAll('.paper-card').length === 0) {
-                paperGrid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; margin-top: 2rem; color: #94a3b8;">All caught up!</div>';
-            }
-        }, 300);
-        refreshAllBadges({ force: true });
-
-    } catch (err) {
-        console.error("Rate Error:", err);
-        alert("Failed to rate paper: " + (err.message || str(err)));
+    if (cardsUiModule && typeof cardsUiModule.handleRate === 'function') {
+        return cardsUiModule.handleRate(id, status, btnElement);
     }
 };
 
@@ -3931,545 +3922,93 @@ window.loadVersionDiff = async () => {
     }
 };
 
-function updateReadingTimelineUI(status, progress) {
-    const steps = document.querySelectorAll('#readingTimeline .reading-step');
-    steps.forEach((step) => {
-        const stepKey = step.getAttribute('data-step');
-        step.classList.remove('active');
-        step.classList.remove('complete');
-        if (status === stepKey) {
-            step.classList.add('active');
-        }
-    });
-    if (status === 'done') {
-        steps.forEach((step) => step.classList.add('complete'));
-    } else if (status === 'reading') {
-        steps.forEach((step) => {
-            const stepKey = step.getAttribute('data-step');
-            if (stepKey === 'queue') step.classList.add('complete');
-        });
+function invokeReadingPlanModule(method, ...args) {
+    if (!readingPlanUiModule || typeof readingPlanUiModule[method] !== 'function') {
+        console.warn(`Reading plan module method unavailable: ${method}`);
+        return undefined;
     }
-    const progressInput = document.getElementById('readingProgressInput');
-    const progressLabel = document.getElementById('readingProgressLabel');
-    const progressBar = document.getElementById('readingProgressBar');
-    if (progressInput) progressInput.value = String(progress || 0);
-    if (progressLabel) progressLabel.textContent = `${progress || 0}%`;
-    if (progressBar) progressBar.style.width = `${progress || 0}%`;
+    return readingPlanUiModule[method](...args);
 }
 
-function resetReadingExtrasUI() {
-    const estimateVal = document.getElementById('readingEstimateValue');
-    const estimateMeta = document.getElementById('readingEstimateMeta');
-    const questionsList = document.getElementById('readingQuestionsList');
-    if (estimateVal) estimateVal.textContent = 'Not estimated';
-    if (estimateMeta) estimateMeta.textContent = '';
-    if (questionsList) questionsList.textContent = 'No questions generated yet.';
+function estimateReadingTime(forceDownload = false) {
+    return invokeReadingPlanModule('estimateReadingTime', forceDownload);
 }
+window.estimateReadingTime = estimateReadingTime;
 
-function updateReadingEstimateUI(payload) {
-    const estimateVal = document.getElementById('readingEstimateValue');
-    const estimateMeta = document.getElementById('readingEstimateMeta');
-    if (!estimateVal) return;
-    if (!payload || payload.available === false) {
-        estimateVal.textContent = 'Not available';
-        if (estimateMeta) {
-            estimateMeta.textContent = payload && payload.reason ? payload.reason : '';
-        }
-        return;
-    }
-    const minutes = Number(payload.minutes || 0);
-    const pages = Number(payload.page_count || 0);
-    estimateVal.textContent = minutes > 0 ? `~${minutes} min` : 'Not estimated';
-    if (estimateMeta) {
-        const cachedNote = payload.cached ? ' · cached' : '';
-        estimateMeta.textContent = pages > 0 ? `${pages} pages${cachedNote}` : cachedNote.trim();
-    }
+function loadReadingQuestions(refresh = false) {
+    return invokeReadingPlanModule('loadReadingQuestions', refresh);
 }
+window.loadReadingQuestions = loadReadingQuestions;
 
-window.estimateReadingTime = async (forceDownload = false) => {
-    if (!activeReadingPaperId) return;
-    const estimateVal = document.getElementById('readingEstimateValue');
-    if (estimateVal) estimateVal.textContent = 'Estimating...';
-    try {
-        const params = new URLSearchParams();
-        if (forceDownload) {
-            params.set('download', 'true');
-            params.set('refresh', 'true');
-        }
-        const qs = params.toString();
-        const url = `${API_BASE}/papers/${encodeURIComponent(activeReadingPaperId)}/reading-time${qs ? `?${qs}` : ''}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to estimate reading time");
-        updateReadingEstimateUI(data);
-    } catch (e) {
-        updateReadingEstimateUI({ available: false, reason: e.message });
-    }
-};
-
-window.loadReadingQuestions = async (refresh = false) => {
-    if (!activeReadingPaperId) return;
-    const list = document.getElementById('readingQuestionsList');
-    if (list) list.innerHTML = '<div class="loader"></div>';
-    try {
-        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(activeReadingPaperId)}/questions?refresh=${refresh ? 'true' : 'false'}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load questions");
-        const questions = Array.isArray(data.questions) ? data.questions : [];
-        if (!questions.length) {
-            if (list) list.textContent = 'No questions generated yet.';
-            return;
-        }
-        if (list) {
-            list.innerHTML = `<ol>${questions.map(q => `<li>${escapeHtml(q)}</li>`).join('')}</ol>`;
-        }
-    } catch (e) {
-        if (list) list.textContent = `Failed to load questions: ${e.message}`;
-    }
-};
-
-window.openReadingModal = async (paperId) => {
-    activeReadingPaperId = paperId;
-    activeReadingStatus = 'queue';
-    recordTrail({ type: 'reading', paper_id: paperId, label: `Reading: ${getPaperTitleById(paperId)}` });
-    const titleEl = document.getElementById('readingModalTitle');
-    const paper = (allPapers || []).find(p => p.id === paperId) || (currentVisiblePapers || []).find(p => p.id === paperId);
-    if (titleEl) titleEl.textContent = paper ? paper.title : 'Reading Status';
-    showModal('readingModal');
-
-    const progressInput = document.getElementById('readingProgressInput');
-    if (progressInput) {
-        progressInput.oninput = (e) => {
-            const value = Number(e.target.value || 0);
-            updateReadingTimelineUI(activeReadingStatus, value);
-        };
-    }
-    resetReadingExtrasUI();
-    estimateReadingTime(false);
-    loadReadingQuestions(false);
-
-    try {
-        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(paperId)}/reading`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load reading status");
-        activeReadingStatus = data.status || 'queue';
-        updateReadingTimelineUI(activeReadingStatus, Number(data.progress || 0));
-    } catch (e) {
-        updateReadingTimelineUI('queue', 0);
-    }
-};
-
-window.closeReadingModal = () => {
-    hideModal('readingModal');
-    activeReadingPaperId = null;
-};
-
-window.setReadingStatus = (status) => {
-    activeReadingStatus = status || 'queue';
-    const progressInput = document.getElementById('readingProgressInput');
-    const progress = progressInput ? Number(progressInput.value || 0) : 0;
-    updateReadingTimelineUI(activeReadingStatus, progress);
-};
-
-window.saveReadingStatus = async () => {
-    if (!activeReadingPaperId) return;
-    const progressInput = document.getElementById('readingProgressInput');
-    const progress = progressInput ? Number(progressInput.value || 0) : 0;
-    try {
-        const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(activeReadingPaperId)}/reading`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status: activeReadingStatus, progress })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to save reading status");
-        updatePaperLocal(activeReadingPaperId, {
-            reading_status: data.status,
-            reading_progress: data.progress,
-            reading_started_at: data.started_at,
-            reading_finished_at: data.finished_at,
-        });
-        renderPaperGrid(currentVisiblePapers);
-        closeReadingModal();
-    } catch (e) {
-        alert(`Failed to save reading status: ${e.message}`);
-    }
-};
-
-function setReadingPlanStatus(text, isError = false) {
-    const statusEl = document.getElementById('readingPlanStatus');
-    if (!statusEl) return;
-    statusEl.style.color = isError ? 'var(--danger)' : 'var(--text-muted)';
-    statusEl.textContent = text || '';
+function openReadingModal(paperId) {
+    return invokeReadingPlanModule('openReadingModal', paperId);
 }
+window.openReadingModal = openReadingModal;
 
-function renderReadingPlanProgress(payload) {
-    const el = document.getElementById('readingPlanProgress');
-    if (!el) return;
-    if (!payload || typeof payload !== 'object') {
-        el.textContent = '';
-        return;
-    }
-    const streak = Number(payload.streak_days || 0);
-    const totals = payload.totals || {};
-    const done = Number(totals.done_count || 0);
-    const planned = Number(totals.planned_count || 0);
-    const carry = payload.carry_over || {};
-    const carryCount = Number(carry.count || 0);
-    const rate = Number(payload.completion_rate || 0);
-    el.textContent = `Streak ${streak} day${streak === 1 ? '' : 's'} · Done ${done}/${planned} · Completion ${(rate * 100).toFixed(1)}%${carryCount > 0 ? ` · Carry-over ${carryCount}` : ''}`;
+function closeReadingModal() {
+    return invokeReadingPlanModule('closeReadingModal');
 }
+window.closeReadingModal = closeReadingModal;
 
-function clearReadingPlanUndoState() {
-    lastReadingPlanAction = null;
-    const bar = document.getElementById('readingPlanUndoBar');
-    const text = document.getElementById('readingPlanUndoText');
-    if (text) text.textContent = '';
-    if (bar) bar.classList.add('hidden');
+function setReadingStatus(status) {
+    return invokeReadingPlanModule('setReadingStatus', status);
 }
+window.setReadingStatus = setReadingStatus;
 
-function setReadingPlanUndoState(action, paperId, paperTitle = '') {
-    const bar = document.getElementById('readingPlanUndoBar');
-    const text = document.getElementById('readingPlanUndoText');
-    if (!bar || !text || !paperId) return;
-    const act = String(action || '').toLowerCase();
-    if (!['done', 'defer'].includes(act)) {
-        clearReadingPlanUndoState();
-        return;
-    }
-    lastReadingPlanAction = { action: act, paperId: String(paperId), paperTitle: String(paperTitle || '') };
-    const label = lastReadingPlanAction.paperTitle || lastReadingPlanAction.paperId;
-    text.textContent = act === 'done'
-        ? `Marked done: ${label}`
-        : `Deferred: ${label}`;
-    bar.classList.remove('hidden');
+function saveReadingStatus() {
+    return invokeReadingPlanModule('saveReadingStatus');
 }
+window.saveReadingStatus = saveReadingStatus;
 
-function getReadingPlanOptionsFromUi() {
-    const totalInput = document.getElementById('planTotalMinutes');
-    const maxInput = document.getElementById('planMaxItems');
-    const budgetMode = document.getElementById('planBudgetMode');
-    const includeNew = document.getElementById('planIncludeNew');
-    const includeLiked = document.getElementById('planIncludeLiked');
-    const includeBookmarked = document.getElementById('planIncludeBookmarked');
-    const mode = String(budgetMode?.value || 'balanced').toLowerCase();
-    return {
-        total_minutes: Math.max(10, Math.min(360, Number(totalInput?.value || 60))),
-        max_items: Math.max(1, Math.min(20, Number(maxInput?.value || 6))),
-        budget_mode: ['balanced', 'focus', 'sprint', 'deep'].includes(mode) ? mode : 'balanced',
-        include_new: Boolean(includeNew?.checked),
-        include_liked: Boolean(includeLiked?.checked),
-        include_bookmarked: Boolean(includeBookmarked?.checked),
-    };
+function applyReadingPlanPreset(preset) {
+    return invokeReadingPlanModule('applyReadingPlanPreset', preset);
 }
+window.applyReadingPlanPreset = applyReadingPlanPreset;
 
-function applyReadingPlanOptionsToUi(options) {
-    if (!options || typeof options !== 'object') return;
-    const totalInput = document.getElementById('planTotalMinutes');
-    const maxInput = document.getElementById('planMaxItems');
-    const budgetMode = document.getElementById('planBudgetMode');
-    const includeNew = document.getElementById('planIncludeNew');
-    const includeLiked = document.getElementById('planIncludeLiked');
-    const includeBookmarked = document.getElementById('planIncludeBookmarked');
-    if (totalInput && options.total_minutes != null) totalInput.value = String(Number(options.total_minutes));
-    if (maxInput && options.max_items != null) maxInput.value = String(Number(options.max_items));
-    if (budgetMode && options.budget_mode != null) budgetMode.value = String(options.budget_mode);
-    if (includeNew && options.include_new != null) includeNew.checked = Boolean(options.include_new);
-    if (includeLiked && options.include_liked != null) includeLiked.checked = Boolean(options.include_liked);
-    if (includeBookmarked && options.include_bookmarked != null) includeBookmarked.checked = Boolean(options.include_bookmarked);
+function openReadingPlanModal() {
+    return invokeReadingPlanModule('openReadingPlanModal');
 }
+window.openReadingPlanModal = openReadingPlanModal;
 
-window.applyReadingPlanPreset = async (preset) => {
-    const mode = String(preset || '').toLowerCase();
-    const totalInput = document.getElementById('planTotalMinutes');
-    const maxInput = document.getElementById('planMaxItems');
-    const budgetMode = document.getElementById('planBudgetMode');
-    const includeNew = document.getElementById('planIncludeNew');
-    const includeLiked = document.getElementById('planIncludeLiked');
-    const includeBookmarked = document.getElementById('planIncludeBookmarked');
-
-    const presets = {
-        sprint: { total: 30, max: 4, mode: 'sprint', includeNew: true, includeLiked: true, includeBookmarked: true },
-        focus: { total: 60, max: 5, mode: 'focus', includeNew: true, includeLiked: true, includeBookmarked: true },
-        balanced: { total: 90, max: 7, mode: 'balanced', includeNew: true, includeLiked: true, includeBookmarked: true },
-        deep: { total: 120, max: 4, mode: 'deep', includeNew: false, includeLiked: true, includeBookmarked: true },
-    };
-    const selected = presets[mode] || presets.balanced;
-    if (totalInput) totalInput.value = String(selected.total);
-    if (maxInput) maxInput.value = String(selected.max);
-    if (budgetMode) budgetMode.value = selected.mode;
-    if (includeNew) includeNew.checked = Boolean(selected.includeNew);
-    if (includeLiked) includeLiked.checked = Boolean(selected.includeLiked);
-    if (includeBookmarked) includeBookmarked.checked = Boolean(selected.includeBookmarked);
-    await generateReadingPlan(true);
-};
-
-function renderReadingPlan(payload) {
-    const listEl = document.getElementById('readingPlanList');
-    if (!listEl) return;
-    const items = Array.isArray(payload?.items) ? payload.items : [];
-    const budget = Number(payload?.total_minutes_budget || 0);
-    const planned = Number(payload?.planned_minutes || 0);
-    const count = Number(payload?.count || items.length || 0);
-    const cached = Boolean(payload?.cached);
-    const deferredCount = Number(payload?.deferred_count || 0);
-    const budgetMode = String(payload?.options?.budget_mode || payload?.budget_mode || 'balanced');
-    setReadingPlanStatus(
-        `${count} item${count === 1 ? '' : 's'} · ${planned}/${budget} min planned · mode ${budgetMode}${deferredCount ? ` · deferred ${deferredCount}` : ''}${cached ? ' · cached' : ''}`
-    );
-
-    if (!items.length) {
-        listEl.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:1rem 0.5rem;">No candidates matched this plan. Try increasing minutes or enabling more sources.</div>';
-        return;
-    }
-
-    listEl.innerHTML = items.map((item) => {
-        const pid = String(item.id || '');
-        const title = item.title || pid || 'Paper';
-        const published = String(item.published || '').slice(0, 10);
-        const status = String(item.status || 'queue');
-        const progress = Number(item.progress || 0);
-        const minutesRemaining = Number(item.minutes_remaining || 0);
-        const minutesTotal = Number(item.minutes_total || 0);
-        const sources = Array.isArray(item.sources) ? item.sources.join(', ') : '';
-        const score = Number(item.score || 0);
-        return `
-            <div class="reading-plan-item">
-                <div class="reading-plan-title">${escapeHtml(title)}</div>
-                <div class="reading-plan-meta">
-                    ${escapeHtml(published)} · ${escapeHtml(status)} (${progress}%) · ${minutesRemaining} min remaining (of ${minutesTotal})
-                </div>
-                <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                    ${sources ? `<span class="tag" style="background:rgba(56,189,248,0.14); color:#7dd3fc;">${escapeHtml(sources)}</span>` : ''}
-                    <span class="tag" style="background:rgba(16,185,129,0.14); color:#6ee7b7;">score ${score.toFixed(2)}</span>
-                </div>
-                <div class="reading-plan-actions">
-                    <a href="${API_BASE}/papers/${encodeURIComponent(pid)}/pdf" target="_blank" class="pdf-link"><i class="fa-regular fa-file-pdf"></i> PDF</a>
-                    <button class="btn-secondary" onclick="openReadingModal(decodeURIComponent('${encodeURIComponent(pid)}'))" style="padding:0.3rem 0.7rem;">
-                        <i class="fa-solid fa-book-open-reader"></i> Reading
-                    </button>
-                    <button class="btn-secondary" onclick="openNotesModal(decodeURIComponent('${encodeURIComponent(pid)}'))" style="padding:0.3rem 0.7rem;">
-                        <i class="fa-solid fa-note-sticky"></i> Notes
-                    </button>
-                    <button class="btn-secondary" onclick="applyReadingPlanItemAction(decodeURIComponent('${encodeURIComponent(pid)}'),'done')" style="padding:0.3rem 0.7rem;">
-                        <i class="fa-solid fa-check"></i> Done
-                    </button>
-                    <button class="btn-secondary" onclick="applyReadingPlanItemAction(decodeURIComponent('${encodeURIComponent(pid)}'),'defer')" style="padding:0.3rem 0.7rem;">
-                        <i class="fa-solid fa-clock"></i> Defer
-                    </button>
-                </div>
-            </div>
-        `;
-    }).join('');
+function closeReadingPlanModal() {
+    return invokeReadingPlanModule('closeReadingPlanModal');
 }
+window.closeReadingPlanModal = closeReadingPlanModal;
 
-function renderReadingPlanHistory(historyItems) {
-    const selectEl = document.getElementById('readingPlanHistorySelect');
-    if (!selectEl) return;
-    const items = Array.isArray(historyItems) ? historyItems : [];
-    const currentDate = activeReadingPlanPayload?.date || '';
-    const options = ['<option value="">Today</option>'];
-    items.forEach((item) => {
-        const date = String(item.plan_date || '').trim();
-        if (!date) return;
-        const label = `${date} · ${Number(item.count || 0)} items · ${Number(item.planned_minutes || 0)}m`;
-        options.push(`<option value="${escapeHtml(date)}"${date === currentDate ? ' selected' : ''}>${escapeHtml(label)}</option>`);
-    });
-    selectEl.innerHTML = options.join('');
+function loadReadingPlanHistory() {
+    return invokeReadingPlanModule('loadReadingPlanHistory');
 }
+window.loadReadingPlanHistory = loadReadingPlanHistory;
 
-window.openReadingPlanModal = async () => {
-    recordTrail({ type: 'reading_plan', label: 'Reading plan' });
-    showModal('readingPlanModal');
-    clearReadingPlanUndoState();
-    renderReadingPlanProgress(null);
-    const listEl = document.getElementById('readingPlanList');
-    if (listEl) listEl.innerHTML = '<div class="loader"></div>';
-    await loadTodayReadingPlan(false);
-    await loadReadingPlanHistory();
-};
+function loadReadingPlanProgress(days = 14) {
+    return invokeReadingPlanModule('loadReadingPlanProgress', days);
+}
+window.loadReadingPlanProgress = loadReadingPlanProgress;
 
-window.closeReadingPlanModal = () => {
-    hideModal('readingPlanModal');
-};
+function loadTodayReadingPlan(refresh = false) {
+    return invokeReadingPlanModule('loadTodayReadingPlan', refresh);
+}
+window.loadTodayReadingPlan = loadTodayReadingPlan;
 
-window.loadReadingPlanHistory = async () => {
-    try {
-        const res = await fetch(`${API_BASE}/reading-plan/history?limit=40`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load reading plan history");
-        renderReadingPlanHistory(data.items || []);
-    } catch (e) {
-        // Keep modal usable even if history fails.
-    }
-};
+function generateReadingPlan(refresh = true) {
+    return invokeReadingPlanModule('generateReadingPlan', refresh);
+}
+window.generateReadingPlan = generateReadingPlan;
 
-window.loadReadingPlanProgress = async (days = 14) => {
-    try {
-        const span = Math.max(1, Math.min(90, Number(days || 14)));
-        const res = await fetch(`${API_BASE}/reading-plan/progress?days=${span}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load reading plan progress");
-        renderReadingPlanProgress(data);
-    } catch (e) {
-        const el = document.getElementById('readingPlanProgress');
-        if (el) el.textContent = `Progress unavailable: ${e.message}`;
-    }
-};
+function loadSelectedReadingPlanHistory() {
+    return invokeReadingPlanModule('loadSelectedReadingPlanHistory');
+}
+window.loadSelectedReadingPlanHistory = loadSelectedReadingPlanHistory;
 
-window.loadTodayReadingPlan = async (refresh = false) => {
-    try {
-        setReadingPlanStatus('Loading today\'s plan...');
-        const url = `${API_BASE}/reading-plan/today${refresh ? '?refresh=true' : ''}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load reading plan");
-        activeReadingPlanPayload = data;
-        applyReadingPlanOptionsToUi(data.options || {
-            total_minutes: data.total_minutes_budget,
-            max_items: data.max_items,
-            budget_mode: 'balanced',
-            include_new: true,
-            include_liked: true,
-            include_bookmarked: true,
-        });
-        renderReadingPlan(data);
-        await loadReadingPlanHistory();
-        await loadReadingPlanProgress(14);
-    } catch (e) {
-        setReadingPlanStatus(`Failed to load plan: ${e.message}`, true);
-        const listEl = document.getElementById('readingPlanList');
-        if (listEl) listEl.innerHTML = '';
-    }
-};
+function applyReadingPlanItemAction(paperId, action) {
+    return invokeReadingPlanModule('applyReadingPlanItemAction', paperId, action);
+}
+window.applyReadingPlanItemAction = applyReadingPlanItemAction;
 
-window.generateReadingPlan = async (refresh = true) => {
-    try {
-        setReadingPlanStatus('Generating plan...');
-        const options = getReadingPlanOptionsFromUi();
-        const res = await fetch(`${API_BASE}/reading-plan/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                total_minutes: options.total_minutes,
-                max_items: options.max_items,
-                budget_mode: options.budget_mode,
-                include_new: options.include_new,
-                include_liked: options.include_liked,
-                include_bookmarked: options.include_bookmarked,
-                refresh: Boolean(refresh),
-            })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to generate reading plan");
-        activeReadingPlanPayload = data;
-        applyReadingPlanOptionsToUi(data.options || options);
-        renderReadingPlan(data);
-        await loadReadingPlanHistory();
-        await loadReadingPlanProgress(14);
-    } catch (e) {
-        setReadingPlanStatus(`Failed to generate plan: ${e.message}`, true);
-    }
-};
-
-window.loadSelectedReadingPlanHistory = async () => {
-    const selectEl = document.getElementById('readingPlanHistorySelect');
-    if (!selectEl || !selectEl.value) {
-        await loadTodayReadingPlan(false);
-        return;
-    }
-    const date = String(selectEl.value).trim();
-    if (!date) {
-        await loadTodayReadingPlan(false);
-        return;
-    }
-    try {
-        setReadingPlanStatus(`Loading plan for ${date}...`);
-        const res = await fetch(`${API_BASE}/reading-plan/${encodeURIComponent(date)}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load historical reading plan");
-        activeReadingPlanPayload = data;
-        applyReadingPlanOptionsToUi(data.options || {
-            total_minutes: data.total_minutes_budget,
-            max_items: data.max_items,
-            budget_mode: 'balanced',
-            include_new: true,
-            include_liked: true,
-            include_bookmarked: true,
-        });
-        renderReadingPlan(data);
-        await loadReadingPlanHistory();
-        await loadReadingPlanProgress(14);
-    } catch (e) {
-        setReadingPlanStatus(`Failed to load history plan: ${e.message}`, true);
-    }
-};
-
-window.applyReadingPlanItemAction = async (paperId, action) => {
-    if (!paperId) return;
-    const act = String(action || '').toLowerCase();
-    if (!['done', 'defer'].includes(act)) return;
-    try {
-        setReadingPlanStatus(act === 'done' ? 'Marking item as done...' : 'Deferring item...');
-        const res = await fetch(`${API_BASE}/reading-plan/action`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                paper_id: paperId,
-                action: act,
-                defer_days: act === 'defer' ? 1 : 0,
-            })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to apply reading plan action");
-        if (act === 'done') {
-            updatePaperLocal(paperId, {
-                reading_status: 'done',
-                reading_progress: 100,
-            });
-            renderPaperGrid(currentVisiblePapers);
-        }
-        const paper = (allPapers || []).find((p) => p.id === paperId) || {};
-        setReadingPlanUndoState(act, paperId, paper.title || '');
-        if (data && data.progress) {
-            renderReadingPlanProgress(data.progress);
-        } else {
-            await loadReadingPlanProgress(14);
-        }
-        await loadTodayReadingPlan(true);
-        await loadReadingPlanHistory();
-    } catch (e) {
-        setReadingPlanStatus(`Failed to apply action: ${e.message}`, true);
-    }
-};
-
-window.undoLastReadingPlanAction = async () => {
-    if (!lastReadingPlanAction || !lastReadingPlanAction.paperId) return;
-    const undoAction = lastReadingPlanAction.action === 'done' ? 'undo_done' : 'undefer';
-    try {
-        setReadingPlanStatus('Undoing last action...');
-        const res = await fetch(`${API_BASE}/reading-plan/action`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                paper_id: lastReadingPlanAction.paperId,
-                action: undoAction,
-            })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to undo action");
-        clearReadingPlanUndoState();
-        if (data && data.progress) {
-            renderReadingPlanProgress(data.progress);
-        } else {
-            await loadReadingPlanProgress(14);
-        }
-        await loadTodayReadingPlan(true);
-        await loadReadingPlanHistory();
-    } catch (e) {
-        setReadingPlanStatus(`Failed to undo action: ${e.message}`, true);
-    }
-};
+function undoLastReadingPlanAction() {
+    return invokeReadingPlanModule('undoLastReadingPlanAction');
+}
+window.undoLastReadingPlanAction = undoLastReadingPlanAction;
 
 function hasWeeklyPickLabel(paper) {
     if (!paper) return false;
@@ -5778,409 +5317,58 @@ window.shareWeeklyReview = async () => {
     }
 };
 
-function setUnifiedInboxStatus(text, isError = false) {
-    const el = document.getElementById('unifiedInboxStatus');
-    if (!el) return;
-    el.style.color = isError ? 'var(--danger)' : 'var(--text-muted)';
-    el.textContent = text || '';
+function invokeInboxModule(method, ...args) {
+    if (!inboxUiModule || typeof inboxUiModule[method] !== 'function') {
+        console.warn(`Inbox module method unavailable: ${method}`);
+        return undefined;
+    }
+    return inboxUiModule[method](...args);
 }
 
-function encodeInboxPayload(payload) {
-    try {
-        return encodeURIComponent(JSON.stringify(payload || {}));
-    } catch (e) {
-        return encodeURIComponent('{}');
-    }
+function toggleUnifiedInboxKinds(checked) {
+    return invokeInboxModule('toggleUnifiedInboxKinds', checked);
 }
+window.toggleUnifiedInboxKinds = toggleUnifiedInboxKinds;
 
-function decodeInboxPayload(payloadJson) {
-    if (!payloadJson) return {};
-    try {
-        return JSON.parse(payloadJson);
-    } catch (e) {
-        return {};
-    }
+function toggleUnifiedInboxItemSelection(payloadJson, checked) {
+    return invokeInboxModule('toggleUnifiedInboxItemSelection', payloadJson, checked);
 }
+window.toggleUnifiedInboxItemSelection = toggleUnifiedInboxItemSelection;
 
-function setUnifiedInboxControlsFromState() {
-    const scopeEl = document.getElementById('unifiedInboxScope');
-    const daysEl = document.getElementById('unifiedInboxDays');
-    const limitEl = document.getElementById('unifiedInboxLimit');
-    const sortEl = document.getElementById('unifiedInboxSort');
-    const viewEl = document.getElementById('unifiedInboxViewMode');
-    const focusEl = document.getElementById('unifiedInboxFocusLimit');
-    if (scopeEl) scopeEl.value = unifiedInboxState.versionScope || 'watchlist';
-    if (daysEl) daysEl.value = String(unifiedInboxState.versionDays || 30);
-    if (limitEl) limitEl.value = String(unifiedInboxState.limit || 80);
-    if (sortEl) sortEl.value = unifiedInboxState.sort || 'recent';
-    if (viewEl) viewEl.value = unifiedInboxState.viewMode || 'all';
-    if (focusEl) focusEl.value = String(unifiedInboxState.focusLimit || 12);
-    const kinds = new Set((unifiedInboxState.kinds || []).map((k) => String(k).toLowerCase()));
-    const checks = [
-        ['unifiedInboxKindAlert', 'alert'],
-        ['unifiedInboxKindVersion', 'version_update'],
-        ['unifiedInboxKindFollowup', 'follow_up'],
-        ['unifiedInboxKindDigest', 'digest'],
-    ];
-    checks.forEach(([id, kind]) => {
-        const el = document.getElementById(id);
-        if (el) el.checked = kinds.has(kind);
-    });
+function clearUnifiedInboxSelection() {
+    return invokeInboxModule('clearUnifiedInboxSelection');
 }
+window.clearUnifiedInboxSelection = clearUnifiedInboxSelection;
 
-function getUnifiedInboxKindsFromUi() {
-    const checks = [
-        ['unifiedInboxKindAlert', 'alert'],
-        ['unifiedInboxKindVersion', 'version_update'],
-        ['unifiedInboxKindFollowup', 'follow_up'],
-        ['unifiedInboxKindDigest', 'digest'],
-    ];
-    return checks
-        .filter(([id]) => Boolean(document.getElementById(id)?.checked))
-        .map(([, kind]) => kind);
+function toggleUnifiedInboxSelectAll(checked) {
+    return invokeInboxModule('toggleUnifiedInboxSelectAll', checked);
 }
+window.toggleUnifiedInboxSelectAll = toggleUnifiedInboxSelectAll;
 
-function readUnifiedInboxFiltersFromUi() {
-    const scopeEl = document.getElementById('unifiedInboxScope');
-    const daysEl = document.getElementById('unifiedInboxDays');
-    const limitEl = document.getElementById('unifiedInboxLimit');
-    const sortEl = document.getElementById('unifiedInboxSort');
-    const viewEl = document.getElementById('unifiedInboxViewMode');
-    const focusEl = document.getElementById('unifiedInboxFocusLimit');
-    const rawScope = String(scopeEl?.value || unifiedInboxState.versionScope || 'watchlist').toLowerCase();
-    const versionScope = ['watchlist', 'liked', 'bookmarked', 'new'].includes(rawScope) ? rawScope : 'watchlist';
-    const versionDays = Math.max(1, Math.min(180, Number(daysEl?.value || unifiedInboxState.versionDays || 30)));
-    const limit = Math.max(10, Math.min(200, Number(limitEl?.value || unifiedInboxState.limit || 80)));
-    const sort = String(sortEl?.value || unifiedInboxState.sort || 'recent').toLowerCase() === 'priority' ? 'priority' : 'recent';
-    const viewMode = String(viewEl?.value || unifiedInboxState.viewMode || 'all').toLowerCase() === 'focus' ? 'focus' : 'all';
-    const focusLimit = Math.max(1, Math.min(80, Number(focusEl?.value || unifiedInboxState.focusLimit || 12)));
-    const kinds = getUnifiedInboxKindsFromUi();
-    return { versionScope, versionDays, limit, kinds, sort, viewMode, focusLimit };
+function applyUnifiedInboxBulkAction() {
+    return invokeInboxModule('applyUnifiedInboxBulkAction');
 }
+window.applyUnifiedInboxBulkAction = applyUnifiedInboxBulkAction;
 
-window.toggleUnifiedInboxKinds = (checked) => {
-    ['unifiedInboxKindAlert', 'unifiedInboxKindVersion', 'unifiedInboxKindFollowup', 'unifiedInboxKindDigest']
-        .forEach((id) => {
-            const el = document.getElementById(id);
-            if (el) el.checked = Boolean(checked);
-        });
-    refreshUnifiedInbox();
-};
-
-function buildUnifiedInboxSelectionItem(item) {
-    const kind = String(item?.kind || '');
-    const payload = {
-        id: String(item?.id || ''),
-        kind,
-        alert_id: item?.alert_id != null ? Number(item.alert_id) : null,
-        follow_id: item?.follow_id != null ? String(item.follow_id) : null,
-        digest_id: item?.digest_id != null ? Number(item.digest_id) : null,
-        paper_id: item?.paper_id != null ? String(item.paper_id) : null,
-        arxiv_base_id: item?.arxiv_base_id != null ? String(item.arxiv_base_id) : null,
-    };
-    return payload;
+function openUnifiedInboxModal() {
+    return invokeInboxModule('openUnifiedInboxModal');
 }
+window.openUnifiedInboxModal = openUnifiedInboxModal;
 
-function updateUnifiedInboxSelectionUi() {
-    const count = unifiedInboxSelectedItems.size;
-    const countEl = document.getElementById('unifiedInboxSelectionCount');
-    if (countEl) countEl.textContent = `${count} selected`;
-    const allBox = document.getElementById('unifiedInboxSelectAll');
-    if (allBox) {
-        const visible = (unifiedInboxVisibleItems || []).length;
-        allBox.checked = visible > 0 && count > 0 && count >= visible;
-        allBox.indeterminate = count > 0 && count < visible;
-    }
+function closeUnifiedInboxModal() {
+    return invokeInboxModule('closeUnifiedInboxModal');
 }
+window.closeUnifiedInboxModal = closeUnifiedInboxModal;
 
-window.toggleUnifiedInboxItemSelection = (payloadJson, checked) => {
-    const payload = decodeInboxPayload(payloadJson);
-    const key = String(payload.id || '');
-    if (!key) return;
-    if (checked) {
-        unifiedInboxSelectedItems.set(key, payload);
-    } else {
-        unifiedInboxSelectedItems.delete(key);
-    }
-    updateUnifiedInboxSelectionUi();
-};
-
-window.clearUnifiedInboxSelection = () => {
-    unifiedInboxSelectedItems.clear();
-    updateUnifiedInboxSelectionUi();
-    document.querySelectorAll('.unified-inbox-item-check').forEach((el) => {
-        el.checked = false;
-    });
-};
-
-window.toggleUnifiedInboxSelectAll = (checked) => {
-    const want = Boolean(checked);
-    if (!want) {
-        clearUnifiedInboxSelection();
-        return;
-    }
-    (unifiedInboxVisibleItems || []).forEach((item) => {
-        const payload = buildUnifiedInboxSelectionItem(item);
-        const key = String(payload.id || '');
-        if (key) unifiedInboxSelectedItems.set(key, payload);
-    });
-    document.querySelectorAll('.unified-inbox-item-check').forEach((el) => {
-        el.checked = true;
-    });
-    updateUnifiedInboxSelectionUi();
-};
-
-function normalizeUnifiedBulkAction(value) {
-    const action = String(value || '').trim().toLowerCase();
-    if (!action) return '';
-    if (['seen', 'reviewed', 'dismiss', 'snooze', 'done', 'read'].includes(action)) return action;
-    return '';
+function refreshUnifiedInbox() {
+    return invokeInboxModule('refreshUnifiedInbox');
 }
+window.refreshUnifiedInbox = refreshUnifiedInbox;
 
-window.applyUnifiedInboxBulkAction = async () => {
-    const statusEl = document.getElementById('unifiedInboxStatus');
-    const selected = Array.from(unifiedInboxSelectedItems.values());
-    if (!selected.length) {
-        setUnifiedInboxStatus('Select at least one inbox item first.', true);
-        return;
-    }
-    const actionEl = document.getElementById('unifiedInboxBulkAction');
-    const snoozeEl = document.getElementById('unifiedInboxBulkSnoozeDays');
-    const action = normalizeUnifiedBulkAction(actionEl?.value || '');
-    const snoozeDays = Math.max(1, Math.min(90, Number(snoozeEl?.value || 3)));
-    const items = selected.map((row) => {
-        const item = { kind: row.kind };
-        if (action) item.action = action;
-        if (row.alert_id != null) item.alert_id = Number(row.alert_id);
-        if (row.follow_id) item.follow_id = String(row.follow_id);
-        if (row.digest_id != null) item.digest_id = Number(row.digest_id);
-        if (row.paper_id) item.paper_id = String(row.paper_id);
-        if (row.arxiv_base_id) item.arxiv_base_id = String(row.arxiv_base_id);
-        if (action === 'snooze') item.snooze_days = snoozeDays;
-        return item;
-    });
-    if (statusEl) statusEl.textContent = `Applying bulk action to ${items.length} items...`;
-    try {
-        const payload = {
-            action: action || null,
-            snooze_days: snoozeDays,
-            items,
-        };
-        const res = await fetch(`${API_BASE}/inbox/bulk-action`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to apply bulk inbox action");
-        const success = Number(data.success_count || 0);
-        const failure = Number(data.failure_count || 0);
-        setUnifiedInboxStatus(`Bulk action finished: ${success} succeeded, ${failure} failed.`);
-        clearUnifiedInboxSelection();
-        await refreshUnifiedInbox();
-        await refreshAllBadges({ force: true });
-    } catch (e) {
-        setUnifiedInboxStatus(`Bulk action failed: ${e.message}`, true);
-    }
-};
-
-function renderUnifiedInbox(payload) {
-    const list = document.getElementById('unifiedInboxList');
-    if (!list) return;
-    const counts = payload && payload.counts ? payload.counts : {};
-    const total = Number(payload?.total || 0);
-    const items = Array.isArray(payload?.items) ? payload.items : [];
-    unifiedInboxVisibleItems = items.slice();
-    const visibleIds = new Set(items.map((item) => String(item?.id || '')).filter(Boolean));
-    Array.from(unifiedInboxSelectedItems.keys()).forEach((id) => {
-        if (!visibleIds.has(id)) unifiedInboxSelectedItems.delete(id);
-    });
-    setUnifiedInboxStatus(
-        `Total ${total} · Alerts ${Number(counts.alerts || 0)} · Versions ${Number(counts.version_updates || 0)} · Follow-ups ${Number(counts.follow_ups || 0)} · Digests ${Number(counts.digests || 0)}`
-    );
-    if (!items.length) {
-        list.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:1rem;">Inbox is clear.</div>';
-        updateUnifiedInboxSelectionUi();
-        return;
-    }
-
-    list.innerHTML = items.map((item) => {
-        const kind = String(item.kind || '');
-        const title = String(item.title || item.paper_id || kind || 'Inbox item');
-        const ts = String(item.remind_at || item.created_at || item.published || '');
-        const priorityScore = Math.max(0, Number(item.priority_score || 0));
-        const priorityReason = String(item.priority_reason || '').trim();
-        const selectionPayload = buildUnifiedInboxSelectionItem(item);
-        const selectionKey = String(selectionPayload.id || '');
-        const selectionJson = encodeInboxPayload(selectionPayload);
-        const checked = selectionKey && unifiedInboxSelectedItems.has(selectionKey) ? 'checked' : '';
-        const priorityTag = priorityScore > 0
-            ? `<span class="unified-priority-chip" title="${escapeHtml(priorityReason || 'priority score')}">P${Math.round(priorityScore)}</span>`
-            : '';
-        const kindTag = {
-            alert: '<span class="tag" style="background:rgba(245,158,11,0.2); color:#f59e0b;">alert</span>',
-            version_update: '<span class="tag" style="background:rgba(59,130,246,0.2); color:#93c5fd;">version</span>',
-            follow_up: '<span class="tag" style="background:rgba(139,92,246,0.2); color:#c4b5fd;">follow-up</span>',
-            digest: '<span class="tag" style="background:rgba(56,189,248,0.2); color:#7dd3fc;">digest</span>',
-        }[kind] || `<span class="tag">${escapeHtml(kind || 'item')}</span>`;
-
-        let meta = '';
-        let details = '';
-        let actions = '';
-        if (kind === 'alert') {
-            meta = `${escapeHtml(String(item.alert_type || 'alert'))}${ts ? ` · ${escapeHtml(ts.slice(0, 16).replace('T', ' '))}` : ''}`;
-            details = item.message ? `<div style="font-size:0.88rem; color:var(--text-muted); margin-top:0.35rem;">${escapeHtml(String(item.message))}</div>` : '';
-            const payloadSeen = encodeInboxPayload({ alert_id: Number(item.alert_id || 0) });
-            actions = `
-                ${item.paper_id ? `<button class="btn-secondary" onclick="openNotesModal(decodeURIComponent('${encodeURIComponent(String(item.paper_id || ''))}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-note-sticky"></i> Notes</button>` : ''}
-                ${item.alert_type === 'version' && item.paper_id ? `<button class="btn-secondary" onclick="openVersionModal(decodeURIComponent('${encodeURIComponent(String(item.paper_id || ''))}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-code-compare"></i> Diff</button>` : ''}
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('alert','seen',decodeURIComponent('${payloadSeen}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-eye"></i> Mark Seen</button>
-            `;
-        } else if (kind === 'version_update') {
-            meta = `v${Number(item.from_version || 0)} → v${Number(item.to_version || 0)}${ts ? ` · ${escapeHtml(ts.slice(0, 10))}` : ''}`;
-            const changed = Array.isArray(item.changed_structure_fields) ? item.changed_structure_fields : [];
-            details = changed.length
-                ? `<div class="version-change-badges" style="margin-top:0.35rem;">${changed.slice(0, 6).map((name) => `<span class="tag version-change-tag">${escapeHtml(String(name))}</span>`).join('')}</div>`
-                : '';
-            const payloadReviewed = encodeInboxPayload({ arxiv_base_id: item.arxiv_base_id, paper_id: item.paper_id });
-            const payloadSnooze = encodeInboxPayload({ arxiv_base_id: item.arxiv_base_id, paper_id: item.paper_id, snooze_days: 3 });
-            const payloadDismiss = encodeInboxPayload({ arxiv_base_id: item.arxiv_base_id, paper_id: item.paper_id });
-            actions = `
-                <button class="btn-secondary" onclick="openVersionModal(decodeURIComponent('${encodeURIComponent(String(item.paper_id || item.latest_id || ''))}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-code-compare"></i> Diff</button>
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('version_update','reviewed',decodeURIComponent('${payloadReviewed}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-check"></i> Reviewed</button>
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('version_update','snooze',decodeURIComponent('${payloadSnooze}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-clock"></i> Snooze</button>
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('version_update','dismiss',decodeURIComponent('${payloadDismiss}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-eye-slash"></i> Dismiss</button>
-            `;
-        } else if (kind === 'follow_up') {
-            meta = `${ts ? `Due ${escapeHtml(ts.slice(0, 16).replace('T', ' '))}` : 'Due now'}`;
-            details = item.note ? `<div style="font-size:0.88rem; color:var(--text-muted); margin-top:0.35rem;">${escapeHtml(String(item.note))}</div>` : '';
-            const payloadDone = encodeInboxPayload({ follow_id: item.follow_id });
-            const payloadSnooze = encodeInboxPayload({ follow_id: item.follow_id, snooze_days: 3 });
-            actions = `
-                ${item.paper_id ? `<button class="btn-secondary" onclick="openNotesModal(decodeURIComponent('${encodeURIComponent(String(item.paper_id || ''))}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-note-sticky"></i> Notes</button>` : ''}
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('follow_up','done',decodeURIComponent('${payloadDone}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-check"></i> Done</button>
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('follow_up','snooze',decodeURIComponent('${payloadSnooze}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-clock"></i> Snooze</button>
-            `;
-        } else if (kind === 'digest') {
-            meta = `${escapeHtml(String(item.cadence || 'daily'))}${ts ? ` · ${escapeHtml(ts.slice(0, 16).replace('T', ' '))}` : ''}`;
-            details = item.summary ? `<div style="font-size:0.88rem; color:var(--text-muted); margin-top:0.35rem;">${escapeHtml(String(item.summary))}</div>` : '';
-            const payloadRead = encodeInboxPayload({ digest_id: Number(item.digest_id || 0) });
-            actions = `
-                <button class="btn-secondary" onclick="openDigestModal()" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-inbox"></i> Open Digests</button>
-                <button class="btn-secondary" onclick="applyUnifiedInboxAction('digest','read',decodeURIComponent('${payloadRead}'))" style="padding:0.3rem 0.65rem;"><i class="fa-solid fa-check"></i> Mark Read</button>
-            `;
-        }
-
-        const priorityDetail = priorityReason
-            ? `<div style="font-size:0.78rem; color:var(--text-muted); margin-top:0.25rem;">Priority: ${escapeHtml(priorityReason)}</div>`
-            : '';
-
-        return `
-            <div class="unified-inbox-card">
-                <div style="display:flex; justify-content:space-between; gap:0.8rem; align-items:flex-start;">
-                    <div style="flex:1;">
-                        <div style="font-weight:700;">${escapeHtml(title)}</div>
-                        <div style="font-size:0.83rem; color:var(--text-muted); margin-top:0.2rem;">${meta}</div>
-                    </div>
-                    <div style="display:flex; gap:0.4rem; align-items:center;">
-                        ${priorityTag}
-                        ${kindTag}
-                        <label class="unified-inbox-select" style="font-size:0.8rem; color:var(--text-muted);">
-                            <input class="unified-inbox-item-check" type="checkbox" ${checked}
-                                onchange="toggleUnifiedInboxItemSelection(decodeURIComponent('${selectionJson}'), this.checked)">
-                            Select
-                        </label>
-                    </div>
-                </div>
-                ${priorityDetail}
-                ${details}
-                <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">${actions}</div>
-            </div>
-        `;
-    }).join('');
-    updateUnifiedInboxSelectionUi();
+function applyUnifiedInboxAction(kind, action, payloadJson = '{}') {
+    return invokeInboxModule('applyUnifiedInboxAction', kind, action, payloadJson);
 }
-
-window.openUnifiedInboxModal = async () => {
-    recordTrail({ type: 'unified_inbox', label: 'Unified inbox' });
-    showModal('unifiedInboxModal');
-    setUnifiedInboxControlsFromState();
-    syncDayRunControlsFromTopBar();
-    setDayRunStatus('');
-    await loadDayRunPresets();
-    await loadDayRunHistory();
-    await refreshUnifiedInbox();
-};
-
-window.closeUnifiedInboxModal = () => {
-    hideModal('unifiedInboxModal');
-};
-
-window.refreshUnifiedInbox = async () => {
-    const list = document.getElementById('unifiedInboxList');
-    if (list) list.innerHTML = '<div class="loader"></div>';
-    setUnifiedInboxStatus('Loading inbox...');
-    try {
-        const filters = readUnifiedInboxFiltersFromUi();
-        unifiedInboxState = {
-            versionScope: filters.versionScope,
-            versionDays: filters.versionDays,
-            limit: filters.limit,
-            kinds: filters.kinds,
-            sort: filters.sort,
-            viewMode: filters.viewMode,
-            focusLimit: filters.focusLimit,
-        };
-        if (!filters.kinds.length) {
-            renderUnifiedInbox({
-                counts: { alerts: 0, version_updates: 0, follow_ups: 0, digests: 0 },
-                total: 0,
-                items: [],
-            });
-            setUnifiedInboxStatus('Choose at least one kind to load inbox items.');
-            await refreshUnifiedInboxBadge();
-            return;
-        }
-        const params = new URLSearchParams();
-        const endpoint = filters.viewMode === 'focus' ? '/inbox/focus' : '/inbox/unified';
-        const effectiveLimit = filters.viewMode === 'focus' ? filters.focusLimit : filters.limit;
-        params.set('limit', String(effectiveLimit));
-        params.set('version_scope', filters.versionScope);
-        params.set('version_days', String(filters.versionDays));
-        if (filters.viewMode !== 'focus') {
-            params.set('sort', filters.sort || 'recent');
-        }
-        if (filters.kinds?.length) {
-            params.set('kinds', filters.kinds.join(','));
-        }
-        const res = await fetch(`${API_BASE}${endpoint}?${params.toString()}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to load unified inbox");
-        renderUnifiedInbox(data);
-        await refreshUnifiedInboxBadge();
-    } catch (e) {
-        setUnifiedInboxStatus(`Failed to load inbox: ${e.message}`, true);
-        if (list) list.innerHTML = '';
-    }
-};
-
-window.applyUnifiedInboxAction = async (kind, action, payloadJson = '{}') => {
-    try {
-        const extra = decodeInboxPayload(payloadJson || '{}');
-        const body = { kind, action, ...(extra || {}) };
-        const res = await fetch(`${API_BASE}/inbox/action`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to apply inbox action");
-        await refreshUnifiedInbox();
-        await refreshAllBadges({ force: true });
-    } catch (e) {
-        setUnifiedInboxStatus(`Action failed: ${e.message}`, true);
-    }
-};
+window.applyUnifiedInboxAction = applyUnifiedInboxAction;
 
 window.openAlertsModal = async () => {
     showModal('alertsModal');
@@ -7694,31 +6882,8 @@ function extractCodeLink(text) {
 }
 
 window.toggleBookmark = async (id, btnElement) => {
-    // Optimistic UI update
-    const icon = btnElement.querySelector('i');
-    const isActive = btnElement.classList.contains('active');
-
-    // Toggle state locally
-    if (isActive) {
-        btnElement.classList.remove('active');
-        icon.classList.remove('fa-solid');
-        icon.classList.add('fa-regular');
-    } else {
-        btnElement.classList.add('active');
-        icon.classList.remove('fa-regular');
-        icon.classList.add('fa-solid');
-    }
-
-    try {
-        await fetch(`${API_BASE}/papers/${encodeURIComponent(id)}/bookmark`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ active: !isActive })
-        });
-    } catch (err) {
-        console.error(err);
-        alert("Failed to bookmark.");
-        // Revert UI?
+    if (cardsUiModule && typeof cardsUiModule.toggleBookmark === 'function') {
+        return cardsUiModule.toggleBookmark(id, btnElement);
     }
 };
 
@@ -8298,439 +7463,55 @@ window.shareWeeklyPicksDigest = async () => {
     }
 };
 
-function findDayRunPresetById(presetId) {
-    const pid = Number(presetId || 0);
-    if (!pid) return null;
-    return (dayRunPresetsCache || []).find((item) => Number(item?.id || 0) === pid) || null;
+function selectDayRunPreset(presetId) {
+    return invokeInboxModule('selectDayRunPreset', presetId);
 }
+window.selectDayRunPreset = selectDayRunPreset;
 
-function applyDayRunOptionsToUi(options) {
-    const opts = options && typeof options === 'object' ? options : {};
-    const dayRunDate = document.getElementById('dayRunDateInput');
-    const dayRunForce = document.getElementById('dayRunForceCheck');
-    const weekendEl = document.getElementById('dayRunWeekendPolicy');
-    const rulesScopeEl = document.getElementById('dayRunRulesScope');
-    const fetchEl = document.getElementById('dayRunFetchCheck');
-    const rulesEl = document.getElementById('dayRunRulesCheck');
-    const planEl = document.getElementById('dayRunPlanCheck');
-    const inboxRefreshEl = document.getElementById('dayRunInboxRefreshCheck');
-    const topDate = document.getElementById('dateInput');
-    const topForce = document.getElementById('dailyFetchForceCheck');
-
-    const dateVal = String(opts.date || '').trim();
-    if (dayRunDate && dateVal) dayRunDate.value = dateVal;
-    if (dayRunForce && typeof opts.force === 'boolean') dayRunForce.checked = Boolean(opts.force);
-    if (weekendEl) weekendEl.value = String(opts.weekend_policy || 'skip').toLowerCase() === 'run' ? 'run' : 'skip';
-    if (rulesScopeEl) {
-        const scope = String(opts.run_inbox_rules_scope || 'all').toLowerCase();
-        rulesScopeEl.value = ['papers', 'inbox', 'all'].includes(scope) ? scope : 'all';
-    }
-    if (fetchEl && typeof opts.run_fetch === 'boolean') fetchEl.checked = Boolean(opts.run_fetch);
-    if (rulesEl && typeof opts.run_rules === 'boolean') rulesEl.checked = Boolean(opts.run_rules);
-    if (planEl && typeof opts.run_reading_plan === 'boolean') planEl.checked = Boolean(opts.run_reading_plan);
-    if (inboxRefreshEl && typeof opts.run_inbox_refresh === 'boolean') inboxRefreshEl.checked = Boolean(opts.run_inbox_refresh);
-    if (topDate && dateVal) topDate.value = dateVal;
-    if (topForce && typeof opts.force === 'boolean') topForce.checked = Boolean(opts.force);
-
-    const versionScope = String(opts.version_scope || '').toLowerCase();
-    const versionDays = Number(opts.version_days || 0);
-    if (['watchlist', 'liked', 'bookmarked', 'new'].includes(versionScope)) {
-        unifiedInboxState.versionScope = versionScope;
-        const scopeEl = document.getElementById('unifiedInboxScope');
-        if (scopeEl) scopeEl.value = versionScope;
-    }
-    if (Number.isFinite(versionDays) && versionDays > 0) {
-        const bounded = Math.max(1, Math.min(180, versionDays));
-        unifiedInboxState.versionDays = bounded;
-        const daysEl = document.getElementById('unifiedInboxDays');
-        if (daysEl) daysEl.value = String(bounded);
-    }
+function loadDayRunPresets() {
+    return invokeInboxModule('loadDayRunPresets');
 }
+window.loadDayRunPresets = loadDayRunPresets;
 
-function renderDayRunPresetSelect(items, selectedId = null) {
-    const select = document.getElementById('dayRunPresetSelect');
-    if (!select) return;
-    const rows = Array.isArray(items) ? items : [];
-    const preferredId = Number(selectedId || select.value || 0);
-    select.innerHTML = `<option value="">No preset selected</option>` + rows.map((item) => {
-        const id = Number(item?.id || 0);
-        const name = String(item?.name || `Preset ${id}`);
-        const used = item?.last_used_at ? ` · ${String(item.last_used_at).slice(0, 10)}` : '';
-        return `<option value="${id}">${escapeHtml(name)}${escapeHtml(used)}</option>`;
-    }).join('');
-    if (preferredId && rows.some((item) => Number(item?.id || 0) === preferredId)) {
-        select.value = String(preferredId);
-    } else {
-        select.value = '';
-    }
+function saveDayRunPreset() {
+    return invokeInboxModule('saveDayRunPreset');
 }
+window.saveDayRunPreset = saveDayRunPreset;
 
-window.selectDayRunPreset = (presetId) => {
-    const id = Number(presetId || 0);
-    const preset = findDayRunPresetById(id);
-    const nameEl = document.getElementById('dayRunPresetName');
-    const descEl = document.getElementById('dayRunPresetDescription');
-    if (!preset) {
-        if (nameEl) nameEl.value = '';
-        if (descEl) descEl.value = '';
-        return;
-    }
-    if (nameEl) nameEl.value = String(preset.name || '');
-    if (descEl) descEl.value = String(preset.description || '');
-    applyDayRunOptionsToUi(preset.options || {});
-    setDayRunStatus(`Loaded preset: ${preset.name || 'Preset'}`);
-};
-
-window.loadDayRunPresets = async () => {
-    const select = document.getElementById('dayRunPresetSelect');
-    const currentId = Number(select?.value || 0);
-    try {
-        const data = await apiFetchJson(`${API_BASE}/day/presets?limit=100`, { useCache: false });
-        dayRunPresetsCache = Array.isArray(data.items) ? data.items : [];
-        renderDayRunPresetSelect(dayRunPresetsCache, currentId);
-        if (!currentId && dayRunPresetsCache.length) {
-            selectDayRunPreset(dayRunPresetsCache[0].id);
-            if (select) select.value = String(dayRunPresetsCache[0].id);
-        } else if (!dayRunPresetsCache.length) {
-            selectDayRunPreset('');
-        }
-    } catch (e) {
-        setDayRunStatus(`Failed to load presets: ${e.message}`, true);
-    }
-};
-
-window.saveDayRunPreset = async () => {
-    const nameEl = document.getElementById('dayRunPresetName');
-    const descEl = document.getElementById('dayRunPresetDescription');
-    const name = String(nameEl?.value || '').trim();
-    if (!name) {
-        setDayRunStatus('Preset name is required.', true);
-        return;
-    }
-    try {
-        const payload = {
-            name,
-            description: String(descEl?.value || '').trim() || null,
-            options: getDayRunPayloadFromUi(),
-        };
-        const data = await apiFetchJson(`${API_BASE}/day/presets`, {
-            method: 'POST',
-            body: payload,
-            useCache: false,
-        });
-        await loadDayRunPresets();
-        const select = document.getElementById('dayRunPresetSelect');
-        if (select && data?.id) {
-            select.value = String(data.id);
-            selectDayRunPreset(data.id);
-        }
-        setDayRunStatus(`Preset saved: ${name}`);
-    } catch (e) {
-        setDayRunStatus(`Save preset failed: ${e.message}`, true);
-    }
-};
-
-window.updateDayRunPreset = async () => {
-    const select = document.getElementById('dayRunPresetSelect');
-    const presetId = Number(select?.value || 0);
-    if (!presetId) {
-        setDayRunStatus('Select a preset to update.', true);
-        return;
-    }
-    const nameEl = document.getElementById('dayRunPresetName');
-    const descEl = document.getElementById('dayRunPresetDescription');
-    const name = String(nameEl?.value || '').trim();
-    if (!name) {
-        setDayRunStatus('Preset name is required.', true);
-        return;
-    }
-    try {
-        await apiFetchJson(`${API_BASE}/day/presets/${encodeURIComponent(String(presetId))}`, {
-            method: 'PUT',
-            body: {
-                name,
-                description: String(descEl?.value || '').trim() || null,
-                options: getDayRunPayloadFromUi(),
-            },
-            useCache: false,
-        });
-        await loadDayRunPresets();
-        if (select) select.value = String(presetId);
-        selectDayRunPreset(presetId);
-        setDayRunStatus(`Preset updated: ${name}`);
-    } catch (e) {
-        setDayRunStatus(`Update preset failed: ${e.message}`, true);
-    }
-};
-
-window.deleteDayRunPreset = async () => {
-    const select = document.getElementById('dayRunPresetSelect');
-    const presetId = Number(select?.value || 0);
-    if (!presetId) {
-        setDayRunStatus('Select a preset to delete.', true);
-        return;
-    }
-    const preset = findDayRunPresetById(presetId);
-    if (!confirm(`Delete preset "${preset?.name || presetId}"?`)) return;
-    try {
-        await apiFetchJson(`${API_BASE}/day/presets/${encodeURIComponent(String(presetId))}`, {
-            method: 'DELETE',
-            useCache: false,
-        });
-        await loadDayRunPresets();
-        if (select) select.value = '';
-        selectDayRunPreset('');
-        setDayRunStatus('Preset deleted.');
-    } catch (e) {
-        setDayRunStatus(`Delete preset failed: ${e.message}`, true);
-    }
-};
-
-window.runSelectedDayRunPreset = async () => {
-    const select = document.getElementById('dayRunPresetSelect');
-    const presetId = Number(select?.value || 0);
-    if (!presetId) {
-        setDayRunStatus('Select a preset to run.', true);
-        return;
-    }
-    setDayRunStatus(`Running preset #${presetId}...`);
-    try {
-        const data = await apiFetchJson(`${API_BASE}/day/presets/${encodeURIComponent(String(presetId))}/run`, {
-            method: 'POST',
-            useCache: false,
-        });
-        if (currentStatus === 'new') {
-            if (data.date) currentDateFilter = data.date;
-            await loadPapers();
-        }
-        await refreshAllBadges({ force: true });
-        if (!document.getElementById('unifiedInboxModal')?.classList.contains('hidden')) {
-            await refreshUnifiedInbox();
-        }
-        await Promise.all([loadDayRunHistory(), loadDayRunPresets()]);
-        setDayRunStatus(data.summary || `Preset run complete (#${presetId}).`);
-    } catch (e) {
-        setDayRunStatus(`Preset run failed: ${e.message}`, true);
-    }
-};
-
-function setDayRunStatus(text, isError = false) {
-    const el = document.getElementById('dayRunStatus');
-    if (!el) return;
-    el.style.color = isError ? 'var(--danger)' : 'var(--text-muted)';
-    el.textContent = text || '';
+function updateDayRunPreset() {
+    return invokeInboxModule('updateDayRunPreset');
 }
+window.updateDayRunPreset = updateDayRunPreset;
 
-function syncDayRunControlsFromTopBar() {
-    const topDate = document.getElementById('dateInput');
-    const topForce = document.getElementById('dailyFetchForceCheck');
-    const modalDate = document.getElementById('dayRunDateInput');
-    const modalForce = document.getElementById('dayRunForceCheck');
-    if (modalDate && topDate && !modalDate.value) modalDate.value = topDate.value || '';
-    if (modalForce && topForce) modalForce.checked = Boolean(topForce.checked);
+function deleteDayRunPreset() {
+    return invokeInboxModule('deleteDayRunPreset');
 }
+window.deleteDayRunPreset = deleteDayRunPreset;
 
-function getDayRunPayloadFromUi() {
-    const topDate = document.getElementById('dateInput');
-    const topForce = document.getElementById('dailyFetchForceCheck');
-    const dayRunDate = document.getElementById('dayRunDateInput');
-    const dayRunForce = document.getElementById('dayRunForceCheck');
-    const weekendEl = document.getElementById('dayRunWeekendPolicy');
-    const rulesScopeEl = document.getElementById('dayRunRulesScope');
-    const fetchEl = document.getElementById('dayRunFetchCheck');
-    const rulesEl = document.getElementById('dayRunRulesCheck');
-    const planEl = document.getElementById('dayRunPlanCheck');
-    const inboxRefreshEl = document.getElementById('dayRunInboxRefreshCheck');
-
-    const dateVal = String(dayRunDate?.value || topDate?.value || '').trim();
-    const forceVal = Boolean((dayRunForce && dayRunForce.checked) || (topForce && topForce.checked));
-    const weekendPolicy = String(weekendEl?.value || 'skip').toLowerCase() === 'run' ? 'run' : 'skip';
-    const rulesScope = String(rulesScopeEl?.value || 'all').toLowerCase();
-    const payload = {
-        date: dateVal || null,
-        force: forceVal,
-        weekend_policy: weekendPolicy,
-        run_fetch: fetchEl ? Boolean(fetchEl.checked) : true,
-        run_rules: rulesEl ? Boolean(rulesEl.checked) : true,
-        run_reading_plan: planEl ? Boolean(planEl.checked) : true,
-        run_inbox_refresh: inboxRefreshEl ? Boolean(inboxRefreshEl.checked) : true,
-        run_inbox_rules_scope: ['papers', 'inbox', 'all'].includes(rulesScope) ? rulesScope : 'all',
-        refresh_reading_plan: planEl ? Boolean(planEl.checked) : true,
-        version_scope: unifiedInboxState.versionScope || 'watchlist',
-        version_days: Math.max(1, Math.min(180, Number(unifiedInboxState.versionDays || 30))),
-    };
-    if (topDate) topDate.value = dateVal || '';
-    if (topForce) topForce.checked = forceVal;
-    return payload;
+function runSelectedDayRunPreset() {
+    return invokeInboxModule('runSelectedDayRunPreset');
 }
+window.runSelectedDayRunPreset = runSelectedDayRunPreset;
 
-function renderDayRunHistory(items) {
-    const list = document.getElementById('dayRunHistoryList');
-    if (!list) return;
-    const rows = Array.isArray(items) ? items : [];
-    if (!rows.length) {
-        list.innerHTML = '<div style="color:var(--text-muted);">No runs yet.</div>';
-        return;
-    }
-    list.innerHTML = rows.map((item) => {
-        const runId = Number(item.id || 0);
-        const status = String(item.status || 'unknown');
-        const runDate = String(item.run_date || '');
-        const requestedAt = formatIsoShort(item.requested_at || '');
-        const summary = String(item.summary || '').trim() || 'No summary available.';
-        const options = item.options || {};
-        const optsText = `fetch:${options.run_fetch ? 'on' : 'off'} · rules:${options.run_rules ? 'on' : 'off'} · plan:${options.run_reading_plan ? 'on' : 'off'}`;
-        return `
-            <div class="export-history-card">
-                <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:flex-start;">
-                    <div>
-                        <div style="font-weight:600;">${escapeHtml(runDate || 'n/a')} · ${escapeHtml(status)}</div>
-                        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.2rem;">${escapeHtml(requestedAt || 'n/a')} · ${escapeHtml(optsText)}</div>
-                    </div>
-                    <button class="btn-secondary" onclick="retryDayRun(${runId})" style="padding:0.3rem 0.7rem;">
-                        <i class="fa-solid fa-rotate-right"></i> Retry
-                    </button>
-                </div>
-                <div style="font-size:0.82rem; color:var(--text-muted); margin-top:0.35rem;">${escapeHtml(summary)}</div>
-            </div>
-        `;
-    }).join('');
+function loadDayRunHistory() {
+    return invokeInboxModule('loadDayRunHistory');
 }
+window.loadDayRunHistory = loadDayRunHistory;
 
-window.loadDayRunHistory = async () => {
-    const list = document.getElementById('dayRunHistoryList');
-    if (!list) return;
-    list.innerHTML = '<div class="loader"></div>';
-    try {
-        const data = await apiFetchJson(`${API_BASE}/day/runs?limit=20`, { useCache: false });
-        dayRunHistoryCache = Array.isArray(data.items) ? data.items : [];
-        renderDayRunHistory(dayRunHistoryCache);
-    } catch (e) {
-        list.innerHTML = `<div style="color:var(--danger)">Failed to load day runs: ${escapeHtml(e.message)}</div>`;
-    }
-};
+function retryDayRun(runId) {
+    return invokeInboxModule('retryDayRun', runId);
+}
+window.retryDayRun = retryDayRun;
 
-window.retryDayRun = async (runId) => {
-    const id = Number(runId || 0);
-    if (!id) return;
-    setDayRunStatus(`Retrying run #${id}...`);
-    try {
-        const data = await apiFetchJson(`${API_BASE}/day/run/${encodeURIComponent(String(id))}/retry`, {
-            method: 'POST',
-            useCache: false,
-        });
-        setDayRunStatus(data.summary || `Retried run #${id}.`);
-        await refreshAllBadges({ force: true });
-        if (!document.getElementById('unifiedInboxModal')?.classList.contains('hidden')) {
-            await refreshUnifiedInbox();
-        }
-        await loadDayRunHistory();
-    } catch (e) {
-        setDayRunStatus(`Retry failed: ${e.message}`, true);
-    }
-};
+function runDailyFetch() {
+    return invokeInboxModule('runDailyFetch');
+}
+window.runDailyFetch = runDailyFetch;
 
-window.runDailyFetch = async () => {
-    try {
-        const dateInput = document.getElementById('dateInput');
-        const dateVal = dateInput ? dateInput.value : null;
-        const forceCheck = document.getElementById('dailyFetchForceCheck');
-        const force = forceCheck ? forceCheck.checked : false;
-        let res;
-        let data;
-        if (dateVal) {
-            const forceParam = force ? '&force=true' : '';
-            const url = `${API_BASE}/fetch/daily?date=${encodeURIComponent(dateVal)}${forceParam}`;
-            res = await fetch(url, { method: 'POST' });
-            data = await res.json();
-            if (!res.ok) throw new Error(data.detail || "Daily fetch failed.");
-            if (data.skipped) {
-                alert(`Daily fetch skipped: ${data.reason || 'unknown'}`);
-                return;
-            }
-        } else {
-            if (force) {
-                const forceUrl = `${API_BASE}/fetch/daily?force=true`;
-                res = await fetch(forceUrl, { method: 'POST' });
-                data = await res.json();
-                if (!res.ok) throw new Error(data.detail || "Daily fetch failed.");
-                if (data.skipped) {
-                    alert(`Daily fetch skipped: ${data.reason || 'unknown'}`);
-                    return;
-                }
-            } else {
-                res = await fetch(`${API_BASE}/fetch`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ max_results: 20 })
-                });
-                data = await res.json();
-                if (!res.ok) throw new Error(data.detail || "Fetch failed.");
-            }
-        }
-        if (data.skipped) {
-            alert(`Daily fetch skipped: ${data.reason || 'unknown'}`);
-            return;
-        }
-        alert(`Daily fetch complete: ${data.fetched} papers (${data.new} new) for ${data.date}.`);
-        if (currentStatus === 'new') {
-            currentDateFilter = data.date;
-            loadPapers();
-        }
-        refreshAllBadges();
-    } catch (e) {
-        alert(`Daily fetch failed: ${e.message}`);
-    }
-};
-
-window.runMyDay = async () => {
-    const btn = document.getElementById('dayRunBtn');
-    const runBtn = document.querySelector('#unifiedInboxModal button[onclick="runMyDay()"]');
-    const originalHtml = btn ? btn.innerHTML : '';
-    if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
-    }
-    const originalRunHtml = runBtn ? runBtn.innerHTML : '';
-    if (runBtn) {
-        runBtn.disabled = true;
-        runBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
-    }
-    try {
-        const payload = getDayRunPayloadFromUi();
-        setDayRunStatus('Running day workflow...');
-        const res = await fetch(`${API_BASE}/day/run`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Day run failed");
-        if (currentStatus === 'new') {
-            if (data.date) currentDateFilter = data.date;
-            await loadPapers();
-        }
-        await refreshAllBadges({ force: true });
-        if (!document.getElementById('unifiedInboxModal')?.classList.contains('hidden')) {
-            await refreshUnifiedInbox();
-        }
-        await loadDayRunHistory();
-        setDayRunStatus(data.summary || `Day run complete for ${data.date || 'today'}.`);
-        alert(data.summary || `Day run complete for ${data.date || 'today'}.`);
-    } catch (e) {
-        setDayRunStatus(`Run failed: ${e.message}`, true);
-        alert(`Run my day failed: ${e.message}`);
-    } finally {
-        if (btn) {
-            btn.disabled = false;
-            btn.innerHTML = originalHtml || '<i class="fa-solid fa-play"></i>';
-        }
-        if (runBtn) {
-            runBtn.disabled = false;
-            runBtn.innerHTML = originalRunHtml || '<i class="fa-solid fa-play"></i> Run My Day';
-        }
-    }
-};
+function runMyDay() {
+    return invokeInboxModule('runMyDay');
+}
+window.runMyDay = runMyDay;
 console.log("BibTeX Export Function Loaded");
 
 // Selection & Synthesis Logic

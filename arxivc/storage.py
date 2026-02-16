@@ -845,7 +845,12 @@ def init_db():
 
     # Query hot paths
     c.execute("CREATE INDEX IF NOT EXISTS idx_interactions_status_updated ON interactions(status, updated_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_interactions_status_paper ON interactions(status, paper_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_papers_published ON papers(published DESC)")
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_papers_published_day ON papers(substr(published, 1, 10), published DESC)")
+    except sqlite3.OperationalError:
+        pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_papers_fetched_at ON papers(fetched_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_papers_base_version ON papers(arxiv_base_id, arxiv_version DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_interactions_paper_id ON interactions(paper_id)")
@@ -860,6 +865,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_collection_digest_schedules_enabled ON collection_digest_schedules(enabled)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ai_cache_updated ON ai_cache(updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_digest_runs_cadence_created ON digest_runs(cadence, created_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_digest_runs_created ON digest_runs(created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_digest_items_digest_rank ON digest_items(digest_id, item_rank)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_digest_reads_read_at ON digest_reads(read_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_share_tokens_created ON share_tokens(created_at DESC)")
@@ -868,6 +874,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_job_queue_status_updated ON job_queue(status, updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_job_queue_created ON job_queue(created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_daily_fetch_runs_created ON daily_fetch_runs(created_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_daily_fetch_runs_status_updated ON daily_fetch_runs(status, updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_bundle_cache_created ON bundle_cache(created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_export_history_created ON export_history(created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_export_history_kind ON export_history(kind)")
@@ -898,6 +905,10 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_paper_comments_paper ON paper_comments(paper_id, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_comment_mentions_handle_created ON comment_mentions(mention, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_followups_due ON paper_followups(done_at, remind_at)")
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_followups_open_remind ON paper_followups(remind_at) WHERE done_at IS NULL")
+    except sqlite3.OperationalError:
+        pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_assignments_assignee ON paper_assignments(assignee, status, updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_assignments_paper ON paper_assignments(paper_id, updated_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_paper_links_paper ON paper_links(paper_id, created_at DESC)")
@@ -925,6 +936,11 @@ def init_db():
                 "UPDATE papers SET arxiv_base_id = ?, arxiv_version = ? WHERE id = ?",
                 updates,
             )
+    except Exception:
+        pass
+
+    try:
+        c.execute("PRAGMA optimize")
     except Exception:
         pass
 

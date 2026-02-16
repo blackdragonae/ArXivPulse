@@ -1,7 +1,7 @@
 import os
 import threading
 from datetime import datetime, date, timedelta, timezone
-from typing import Any, Callable, Dict, List, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import arxiv
 import requests
@@ -100,11 +100,63 @@ def _seconds_until_rate_limit_lifts(now: datetime | None = None) -> int:
 
 def _set_rate_limit_cooldown(seconds: int = ARXIV_RATE_LIMIT_COOLDOWN_SECONDS) -> int:
     wait = max(1, int(seconds or ARXIV_RATE_LIMIT_COOLDOWN_SECONDS))
-    until = datetime.now(timezone.utc) + timedelta(seconds=wait)
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=wait)
     with _RATE_LIMIT_LOCK:
         global _RATE_LIMIT_UNTIL
+        if _RATE_LIMIT_UNTIL and _RATE_LIMIT_UNTIL > until:
+            until = _RATE_LIMIT_UNTIL
         _RATE_LIMIT_UNTIL = until
-    return wait
+    return max(1, int((until - now).total_seconds()))
+
+
+def clear_rate_limit_cooldown() -> None:
+    with _RATE_LIMIT_LOCK:
+        global _RATE_LIMIT_UNTIL
+        _RATE_LIMIT_UNTIL = None
+
+
+def get_rate_limit_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ref = now or datetime.now(timezone.utc)
+    with _RATE_LIMIT_LOCK:
+        until = _RATE_LIMIT_UNTIL
+    remaining = 0
+    until_iso: Optional[str] = None
+    if until:
+        remaining = max(0, int((until - ref).total_seconds()))
+        until_iso = until.isoformat()
+    return {
+        "active": remaining > 0,
+        "retry_after_seconds": remaining,
+        "until": until_iso,
+        "now": ref.isoformat(),
+    }
+
+
+def _parse_retry_after_seconds(err: Exception) -> Optional[int]:
+    candidates: List[Any] = []
+    candidates.append(getattr(err, "retry_after_seconds", None))
+    response = getattr(err, "response", None)
+    if response is not None:
+        try:
+            candidates.append(response.headers.get("Retry-After"))
+        except Exception:
+            pass
+    headers = getattr(err, "headers", None)
+    if headers is not None:
+        try:
+            candidates.append(headers.get("Retry-After"))
+        except Exception:
+            pass
+
+    for raw in candidates:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except Exception:
+            continue
+    return None
 
 
 def _raise_if_rate_limited() -> None:
@@ -124,7 +176,7 @@ def _with_arxiv_client(op: Callable[[arxiv.Client], T]) -> T:
         except arxiv.HTTPError as err:
             status = int(getattr(err, "status", 0) or 0)
             if status == 429:
-                wait = _set_rate_limit_cooldown()
+                wait = _set_rate_limit_cooldown(_parse_retry_after_seconds(err) or ARXIV_RATE_LIMIT_COOLDOWN_SECONDS)
                 raise ArxivRateLimitError(
                     f"arXiv API returned HTTP 429 (rate limit). Retry in about {wait}s.",
                     retry_after_seconds=wait,

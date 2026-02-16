@@ -49,6 +49,8 @@
                     style="border: 1px solid rgba(34, 197, 94, 0.35); color:#4ade80; border-radius: 6px; margin-left: 0.35rem; width:auto; height:auto; padding: 0.5rem 1rem;">
                     <i class="fa-solid fa-play"></i>
                 </button>
+                <span id="fetchCooldownHint"
+                    style="display:none; margin-left:0.4rem; font-size:0.8rem; color:#fbbf24; white-space:nowrap;"></span>
                 <label style="display:flex; align-items:center; gap:0.4rem; margin-left:0.35rem; font-size:0.8rem; color:var(--text-muted);">
                     <input type="checkbox" id="dailyFetchForceCheck">
                     Force
@@ -420,6 +422,15 @@
                         <label>Max Items</label>
                         <input id="planMaxItems" type="number" min="1" max="20" value="6">
                     </div>
+                    <div>
+                        <label>Mode</label>
+                        <select id="planBudgetMode" style="padding:0.45rem 0.55rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                            <option value="balanced">Balanced</option>
+                            <option value="focus">Focus</option>
+                            <option value="sprint">Sprint</option>
+                            <option value="deep">Deep Dive</option>
+                        </select>
+                    </div>
                     <label><input id="planIncludeNew" type="checkbox" checked> New</label>
                     <label><input id="planIncludeLiked" type="checkbox" checked> Favorites</label>
                     <label><input id="planIncludeBookmarked" type="checkbox" checked> Bookmarked</label>
@@ -428,6 +439,20 @@
                     </button>
                     <button class="btn-secondary" onclick="generateReadingPlan(true)" style="padding:0.4rem 0.75rem;">
                         <i class="fa-solid fa-wand-magic-sparkles"></i> Generate
+                    </button>
+                </div>
+                <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                    <button class="btn-secondary" onclick="applyReadingPlanPreset('sprint')" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-bolt"></i> Sprint 30m
+                    </button>
+                    <button class="btn-secondary" onclick="applyReadingPlanPreset('focus')" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-bullseye"></i> Focus 60m
+                    </button>
+                    <button class="btn-secondary" onclick="applyReadingPlanPreset('balanced')" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-scale-balanced"></i> Balanced 90m
+                    </button>
+                    <button class="btn-secondary" onclick="applyReadingPlanPreset('deep')" style="padding:0.35rem 0.7rem;">
+                        <i class="fa-solid fa-book-open"></i> Deep 120m
                     </button>
                 </div>
                 <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
@@ -511,6 +536,34 @@
                 <textarea id="notesInput" rows="10"
                     style="flex:1; width:100%; padding:0.8rem; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(15,23,42,0.8); color:#e2e8f0; resize:vertical;"
                     placeholder="Write your notes here..."></textarea>
+                <div class="team-notes" style="margin-top:0.2rem;">
+                    <div class="team-notes-header">Templates & Auto Summary</div>
+                    <div style="display:flex; gap:0.55rem; flex-wrap:wrap; align-items:center;">
+                        <select id="notesTemplateSelect"
+                            style="min-width:220px; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="">Select template...</option>
+                        </select>
+                        <button class="btn-secondary" onclick="applyNotesTemplate(false)" style="padding:0.35rem 0.7rem;">
+                            <i class="fa-solid fa-file-lines"></i> Replace
+                        </button>
+                        <button class="btn-secondary" onclick="applyNotesTemplate(true)" style="padding:0.35rem 0.7rem;">
+                            <i class="fa-solid fa-plus"></i> Append
+                        </button>
+                        <button class="btn-secondary" onclick="saveCurrentAsTemplate()" style="padding:0.35rem 0.7rem;">
+                            <i class="fa-solid fa-floppy-disk"></i> Save as Template
+                        </button>
+                        <select id="notesAutoSummaryStyle"
+                            style="padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="concise">Auto summary: concise</option>
+                            <option value="structured">Auto summary: structured</option>
+                            <option value="deep">Auto summary: deep</option>
+                        </select>
+                        <button class="btn-secondary" onclick="insertAutoSummaryBlock()" style="padding:0.35rem 0.7rem;">
+                            <i class="fa-solid fa-wand-magic-sparkles"></i> Insert
+                        </button>
+                    </div>
+                    <div id="notesTemplateStatus" style="font-size:0.82rem; color:var(--text-muted); margin-top:0.35rem;"></div>
+                </div>
                 <div style="display:flex; align-items:center; justify-content:space-between;">
                     <label style="display:flex; align-items:center; gap:0.45rem; font-size:0.9rem; color:var(--text-muted);">
                         <input type="checkbox" id="weeklyPickToggle" onchange="toggleWeeklyPick(this.checked)">
@@ -533,6 +586,28 @@
                         <button class="btn-secondary" onclick="setFollowUp()"><i class="fa-solid fa-bell"></i> Remind</button>
                     </div>
                     <div id="followupStatus" style="font-size:0.82rem; color:var(--text-muted); margin-top:0.4rem;"></div>
+                </div>
+                <div class="team-notes">
+                    <div class="team-notes-header">Assignments</div>
+                    <div style="display:flex; gap:0.55rem; flex-wrap:wrap; align-items:center;">
+                        <input type="text" id="assignmentAssigneeInput" placeholder="@teammate"
+                            style="min-width:140px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <input type="number" id="assignmentDueDaysInput" min="0" max="365" value="7"
+                            style="width:95px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;"
+                            title="Due in days">
+                        <select id="assignmentStatusInput"
+                            style="padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="todo">todo</option>
+                            <option value="in_progress">in_progress</option>
+                            <option value="blocked">blocked</option>
+                            <option value="done">done</option>
+                        </select>
+                        <input type="text" id="assignmentNoteInput" placeholder="Task note"
+                            style="flex:1; min-width:180px; padding:0.55rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                        <button class="btn-secondary" onclick="addAssignment()"><i class="fa-solid fa-user-plus"></i> Assign</button>
+                    </div>
+                    <div id="assignmentStatusLabel" style="font-size:0.82rem; color:var(--text-muted); margin-top:0.35rem;"></div>
+                    <div id="assignmentList" class="team-notes-list" style="margin-top:0.45rem;">No assignments yet.</div>
                 </div>
                 <div class="team-notes">
                     <div class="team-notes-header">Team notes</div>
@@ -1060,7 +1135,7 @@
             </div>
             <div class="modal-body" style="display:flex; flex-direction:column; gap:1rem; overflow-y:auto;">
                 <div
-                    style="display:grid; grid-template-columns: 1.2fr 2fr 0.8fr 0.8fr auto; gap:0.6rem; align-items:end;">
+                    style="display:grid; grid-template-columns: 1.2fr 1.6fr 0.8fr 0.8fr 0.8fr auto; gap:0.6rem; align-items:end;">
                     <div>
                         <label style="font-size:0.82rem; color:var(--text-muted);">Name</label>
                         <input id="agentNameInput" type="text" placeholder="e.g. Diffusion Radar"
@@ -1070,6 +1145,15 @@
                         <label style="font-size:0.82rem; color:var(--text-muted);">ArXiv Query</label>
                         <input id="agentQueryInput" type="text" placeholder='e.g. ti:"diffusion" AND cat:cs.CV'
                             style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Mode</label>
+                        <select id="agentModeInput" onchange="updateSearchAgentFormUi()"
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                            <option value="global">Global</option>
+                            <option value="local">Local</option>
+                            <option value="semantic">Semantic</option>
+                        </select>
                     </div>
                     <div>
                         <label style="font-size:0.82rem; color:var(--text-muted);">Cadence</label>
@@ -1087,6 +1171,16 @@
                     <button class="btn-primary" onclick="createSearchAgent()" style="height:2.4rem;">
                         <i class="fa-solid fa-plus"></i> Save
                     </button>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr; gap:0.45rem;">
+                    <div>
+                        <label style="font-size:0.82rem; color:var(--text-muted);">Semantic source paper (optional: ID/URL)</label>
+                        <input id="agentSourcePaperInput" type="text" placeholder='e.g. http://arxiv.org/abs/2401.01234'
+                            style="width:100%; padding:0.55rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); color:white; border-radius:6px;">
+                    </div>
+                    <div id="agentFormHint" style="font-size:0.8rem; color:var(--text-muted);">
+                        Global/local modes require a query. Semantic mode uses your query and/or source paper as a meaning seed.
+                    </div>
                 </div>
                 <div id="searchAgentsList" style="display:flex; flex-direction:column; gap:0.7rem;">
                     Loading agents...
@@ -1224,6 +1318,10 @@
             style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(99, 102, 241, 0.18); color: #a5b4fc; border: 1px solid rgba(165, 180, 252, 0.4);">
             <i class="fa-solid fa-code-compare"></i> Side-by-side
         </button>
+        <button id="crossPaperQaBtn" class="btn-secondary" onclick="openCrossPaperQaModal()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(34, 197, 94, 0.18); color: #86efac; border: 1px solid rgba(134, 239, 172, 0.4);">
+            <i class="fa-solid fa-comments"></i> Cross-QA
+        </button>
         <button id="benchmarkBtn" class="btn-secondary" onclick="startBenchmarkExtract()"
             style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.4);">
             <i class="fa-solid fa-table-list"></i> Benchmarks
@@ -1231,6 +1329,10 @@
         <button id="citationOverlayBtn" class="btn-secondary" onclick="openCitationOverlay()"
             style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(59, 130, 246, 0.18); color: #93c5fd; border: 1px solid rgba(147, 197, 253, 0.4);">
             <i class="fa-solid fa-diagram-project"></i> Citations
+        </button>
+        <button id="relatedGraphBtn" class="btn-secondary" onclick="openRelatedGraphModal()"
+            style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(14, 165, 233, 0.18); color: #67e8f9; border: 1px solid rgba(103, 232, 249, 0.4);">
+            <i class="fa-solid fa-share-nodes"></i> Related Graph
         </button>
         <button id="batchTagBtn" class="btn-secondary" onclick="openBatchTagModal()"
             style="display:none; border-radius: 20px; padding: 0.5rem 1.5rem; background: rgba(20, 184, 166, 0.18); color: #5eead4; border: 1px solid rgba(94, 234, 212, 0.4);">
@@ -1302,6 +1404,61 @@
                 <div id="compareDiffContent" class="markdown-body" style="line-height:1.6;">
                     Select 2 papers and run side-by-side compare.
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cross-Paper QA Modal -->
+    <div id="crossPaperQaModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 980px; height: 82vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-comments"></i> Cross-Paper Q&A</h2>
+                <button class="close-btn" onclick="closeCrossPaperQaModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="overflow-y:auto; height:100%; display:flex; flex-direction:column; gap:0.8rem;">
+                <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                    <input id="crossPaperQaQuestionInput" type="text" placeholder="Ask a question across selected papers..."
+                        style="flex:1; min-width:220px; padding:0.6rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.18); color:white; border-radius:6px;">
+                    <input id="crossPaperQaTopKInput" type="number" min="1" max="12" value="5"
+                        style="width:90px; padding:0.58rem; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.18); color:white; border-radius:6px;"
+                        title="Max source snippets">
+                    <button class="btn-primary" onclick="runCrossPaperQa()">
+                        <i class="fa-solid fa-paper-plane"></i> Ask
+                    </button>
+                </div>
+                <div id="crossPaperQaMeta" style="font-size:0.84rem; color:var(--text-muted);">
+                    Select papers, then ask a focused question (method, results, assumptions, limitations, etc.).
+                </div>
+                <div id="crossPaperQaAnswer" class="markdown-body" style="line-height:1.6;">
+                    No answer yet.
+                </div>
+                <div id="crossPaperQaSources" style="display:flex; flex-direction:column; gap:0.6rem;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Related Papers Graph Modal -->
+    <div id="relatedGraphModal" class="modal-overlay hidden">
+        <div class="modal-content chat-modal" style="max-width: 1100px; height: 84vh;">
+            <div class="modal-header">
+                <h2><i class="fa-solid fa-share-nodes"></i> Related Papers Graph</h2>
+                <button class="close-btn" onclick="closeRelatedGraphModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:0.7rem; height:100%;">
+                <div style="display:flex; gap:0.6rem; align-items:center; flex-wrap:wrap;">
+                    <label style="font-size:0.84rem; color:var(--text-muted);">Neighbors per anchor</label>
+                    <input id="relatedGraphLimitInput" type="number" min="1" max="20" value="8"
+                        style="width:90px; padding:0.45rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                    <label style="font-size:0.84rem; color:var(--text-muted);">Min similarity</label>
+                    <input id="relatedGraphMinScoreInput" type="number" min="0.3" max="0.99" step="0.01" value="0.68"
+                        style="width:95px; padding:0.45rem; background:rgba(15,23,42,0.8); border:1px solid rgba(255,255,255,0.18); color:#e2e8f0; border-radius:7px;">
+                    <button class="btn-secondary" onclick="runRelatedGraph()" style="padding:0.35rem 0.8rem;">
+                        <i class="fa-solid fa-play"></i> Build
+                    </button>
+                </div>
+                <div id="relatedGraphMeta" style="font-size:0.84rem; color:var(--text-muted);">Select papers and build graph.</div>
+                <div id="relatedGraphContainer"
+                    style="flex:1; min-height:420px; border:1px solid rgba(255,255,255,0.12); border-radius:10px; background:rgba(10,13,22,0.94);"></div>
             </div>
         </div>
     </div>
@@ -1742,6 +1899,23 @@
                             <input type="number" id="inboxRuleSnoozeDays" min="1" max="90" value="3" placeholder="Snooze days"
                                 style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
                         </div>
+                        <div style="display:grid; grid-template-columns: 1fr 160px 160px; gap:0.6rem;">
+                            <div>
+                                <label style="font-size:0.8rem; color:var(--text-muted);">Min novelty (0-1)</label>
+                                <input type="number" id="inboxRuleMinNovelty" min="0" max="1" step="0.05" value="0"
+                                    style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                            </div>
+                            <div>
+                                <label style="font-size:0.8rem; color:var(--text-muted);">Quiet start hour</label>
+                                <input type="number" id="inboxRuleQuietStart" min="-1" max="23" value="-1"
+                                    style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                            </div>
+                            <div>
+                                <label style="font-size:0.8rem; color:var(--text-muted);">Quiet end hour</label>
+                                <input type="number" id="inboxRuleQuietEnd" min="-1" max="23" value="-1"
+                                    style="width:100%; padding:0.5rem; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.2); color:white; border-radius:4px;">
+                            </div>
+                        </div>
                         <textarea id="inboxRuleKeywords" rows="2" placeholder="Keywords (comma or line separated)"
                             style="width:100%;"></textarea>
                         <textarea id="inboxRuleAuthors" rows="2" placeholder="Authors (comma or line separated)"
@@ -1815,7 +1989,7 @@
     <div id="createFolderModal" class="modal-overlay hidden">
         <div class="modal">
             <div class="modal-header">
-                <h3>New Smart Collection</h3>
+                <h3 id="folderModalTitle">New Smart Collection</h3>
                 <button class="close-modal" onclick="closeCreateFolderModal()">&times;</button>
             </div>
             <div class="modal-body">
@@ -1823,9 +1997,22 @@
                     style="width:100%; margin-bottom:1rem;">
                 <input type="text" id="folderQueryInput" placeholder="Search Query (e.g. Large Language Model)"
                     class="search-input" style="width:100%; margin-bottom:1rem;">
+                <input type="text" id="folderDescriptionInput" placeholder="Description (optional)"
+                    class="search-input" style="width:100%; margin-bottom:0.8rem;">
+                <input type="text" id="folderGoalInput" placeholder="Project goal (optional)"
+                    class="search-input" style="width:100%; margin-bottom:0.8rem;">
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.7rem; margin-bottom:0.8rem;">
+                    <input type="number" id="folderTargetCountInput" min="0" value="0" placeholder="Target papers"
+                        class="search-input" style="width:100%;">
+                    <select id="folderStatusInput" class="search-input" style="width:100%;">
+                        <option value="active">active</option>
+                        <option value="paused">paused</option>
+                        <option value="archived">archived</option>
+                    </select>
+                </div>
                 <p style="font-size:0.8rem; color:var(--text-muted);">Papers matching this search will automatically
                     appear in this collection.</p>
-                <button class="btn-primary" onclick="createSmartFolder()"
+                <button id="folderSubmitBtn" class="btn-primary" onclick="createSmartFolder()"
                     style="width:100%; justify-content:center;">Create Collection</button>
             </div>
         </div>
@@ -1929,7 +2116,14 @@
     </div>
 
     <datalist id="recentSearchesList"></datalist>
-    <script src="app.js?v=131"></script>
+    <script src="state.js?v=1"></script>
+    <script src="api.js?v=1"></script>
+    <script src="main.js?v=1"></script>
+    <script src="papers.js?v=1"></script>
+    <script src="cards.js?v=1"></script>
+    <script src="inbox.js?v=1"></script>
+    <script src="reading_plan.js?v=1"></script>
+    <script src="app.js?v=134"></script>
 </body>
 
 </html>

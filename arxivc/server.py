@@ -24,8 +24,10 @@ import sqlite3
 import requests
 from . import client, storage, ranker, downloader, config, indexer, ai_service, citation_service, embeddings, export_service, pdf_service, agent_service
 from .ai_service import extract_text_from_pdf, simple_chat_logic, generate_brief, describe_image
+from .fetch_service import FetchService
 from .routers.read_ops import create_read_ops_router
 from .routers.interactive import create_interactive_router
+from .routers.workflow_actions import create_workflow_actions_router
 
 app = FastAPI()
 
@@ -430,10 +432,6 @@ _API_CACHE_EPOCHS: Dict[str, int] = {
 _PAGED_RANK_CACHE_LOCK = threading.Lock()
 _PAGED_RANK_CACHE: Dict[str, Dict[str, Any]] = {}
 _PAGED_RANK_CACHE_TTL_SECONDS = 45
-_FETCH_PIPELINE_LOCK = threading.Lock()
-_FETCH_PIPELINE_ACTIVE = False
-_FETCH_PIPELINE_TASKS = 0
-_FETCH_PIPELINE_STARTED_AT: Optional[str] = None
 _DAY_RUN_EXEC_LOCK = threading.Lock()
 _DAY_RUN_IDEMPOTENCY_LOCK = threading.Lock()
 _DAY_RUN_ACTIVE_SIGNATURE: Optional[str] = None
@@ -449,6 +447,9 @@ SLOW_REQUEST_THRESHOLD_SEC = 1.5
 LOG_DIR = "logs"
 LOG_FILE_PREFIX = "events"
 LOG_RETENTION_DAYS = 7
+FETCH_RETRY_MAX_ATTEMPTS = max(1, min(int(os.environ.get("ARXIVC_FETCH_RETRY_MAX_ATTEMPTS", "3") or 3), 8))
+FETCH_TIMEOUT_RETRY_SECONDS = max(5, int(os.environ.get("ARXIVC_FETCH_TIMEOUT_RETRY_SECONDS", "25") or 25))
+FETCH_RETRY_MAX_DELAY_SECONDS = max(30, int(os.environ.get("ARXIVC_FETCH_RETRY_MAX_DELAY_SECONDS", "900") or 900))
 READING_PLAN_CACHE_TTL_SECONDS = 24 * 3600
 READING_PLAN_LAST_OPTIONS_KEY = "reading_plan:today:last_options"
 NOTES_TEMPLATES_CACHE_KEY = "notes:templates:v1"
@@ -472,6 +473,40 @@ DEFAULT_NOTES_TEMPLATES: List[Dict[str, str]] = [
 _LOG_LOCK = threading.Lock()
 _LOG_CURRENT_DATE = None
 _LOG_FILE_PATH = None
+_FETCH_TIMEOUT_RE = re.compile(r"timed out after\s*(\d+)s", re.IGNORECASE)
+_FETCH_RETRY_LOCK = threading.Lock()
+_FETCH_RETRY_TIMER: Optional[threading.Timer] = None
+_FETCH_RETRY_STATE: Dict[str, Any] = {
+    "job_id": None,
+    "status": "idle",
+    "mode": None,   # latest | date
+    "date": None,
+    "force": False,
+    "attempt": 0,
+    "max_attempts": FETCH_RETRY_MAX_ATTEMPTS,
+    "reason": None,
+    "scheduled_at": None,
+    "due_at": None,
+    "started_at": None,
+    "completed_at": None,
+    "last_error": None,
+    "last_result": None,
+}
+_METRICS_LOCK = threading.Lock()
+_METRICS_STARTED_AT = datetime.now().isoformat()
+_REQUEST_METRICS: Dict[str, Dict[str, Any]] = {
+    "fetch": {"requests": 0, "errors": 0, "slow": 0, "total_duration_ms": 0.0, "last_status": None, "last_at": None, "last_error": None},
+    "inbox": {"requests": 0, "errors": 0, "slow": 0, "total_duration_ms": 0.0, "last_status": None, "last_at": None, "last_error": None},
+    "search": {"requests": 0, "errors": 0, "slow": 0, "total_duration_ms": 0.0, "last_status": None, "last_at": None, "last_error": None},
+}
+
+
+class _ScheduledFetchError(RuntimeError):
+    def __init__(self, message: str, status_code: int = 0, retry_after_seconds: int = 0):
+        self.status_code = int(status_code or 0)
+        self.retry_after_seconds = int(retry_after_seconds or 0)
+        super().__init__(message)
+
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -480,6 +515,295 @@ def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except Exception:
         return None
+
+
+def _parse_timeout_retry_seconds(message: str) -> int:
+    match = _FETCH_TIMEOUT_RE.search(str(message or ""))
+    if not match:
+        return int(FETCH_TIMEOUT_RETRY_SECONDS)
+    try:
+        timeout_sec = int(match.group(1))
+    except Exception:
+        timeout_sec = int(FETCH_TIMEOUT_RETRY_SECONDS)
+    return max(5, min(timeout_sec + 5, FETCH_RETRY_MAX_DELAY_SECONDS))
+
+
+def _infer_fetch_retry_delay_seconds(
+    *,
+    error: Optional[str] = None,
+    status_code: Optional[int] = None,
+    retry_after_seconds: Optional[int] = None,
+) -> int:
+    status = int(status_code or 0)
+    explicit_retry = int(retry_after_seconds or 0)
+    if status == 429:
+        if explicit_retry > 0:
+            return max(1, min(explicit_retry, FETCH_RETRY_MAX_DELAY_SECONDS))
+        cooldown = client.get_rate_limit_status()
+        cooldown_wait = int(cooldown.get("retry_after_seconds") or 0)
+        if cooldown_wait > 0:
+            return max(1, min(cooldown_wait, FETCH_RETRY_MAX_DELAY_SECONDS))
+        return min(int(client.ARXIV_RATE_LIMIT_COOLDOWN_SECONDS), FETCH_RETRY_MAX_DELAY_SECONDS)
+
+    text = str(error or "").lower()
+    if "timed out" in text:
+        return _parse_timeout_retry_seconds(text)
+    if "fetch_in_progress" in text or "already running" in text:
+        return 8
+    if "temporarily rate limited" in text or "rate limit" in text:
+        cooldown = client.get_rate_limit_status()
+        cooldown_wait = int(cooldown.get("retry_after_seconds") or 0)
+        if cooldown_wait > 0:
+            return max(1, min(cooldown_wait, FETCH_RETRY_MAX_DELAY_SECONDS))
+        return min(int(client.ARXIV_RATE_LIMIT_COOLDOWN_SECONDS), FETCH_RETRY_MAX_DELAY_SECONDS)
+    if "connection" in text:
+        return int(FETCH_TIMEOUT_RETRY_SECONDS)
+    return 0
+
+
+def _fetch_retry_payload_locked(now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    now_ref = now_dt or datetime.now()
+    payload = copy.deepcopy(_FETCH_RETRY_STATE)
+    due_at = _parse_iso_datetime(payload.get("due_at"))
+    remaining = 0
+    if due_at:
+        remaining = max(0, int((due_at - now_ref).total_seconds()))
+    payload["remaining_seconds"] = remaining
+    payload["active"] = bool(payload.get("status") in {"scheduled", "running"})
+    return payload
+
+
+def _mark_fetch_retry_terminal_locked(
+    *,
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    completed_at: Optional[str] = None,
+) -> None:
+    global _FETCH_RETRY_TIMER
+    _FETCH_RETRY_STATE["status"] = status
+    _FETCH_RETRY_STATE["completed_at"] = completed_at or datetime.now().isoformat()
+    _FETCH_RETRY_STATE["due_at"] = None
+    _FETCH_RETRY_STATE["scheduled_at"] = None
+    _FETCH_RETRY_STATE["started_at"] = _FETCH_RETRY_STATE.get("started_at")
+    _FETCH_RETRY_STATE["last_result"] = result
+    _FETCH_RETRY_STATE["last_error"] = error
+    _FETCH_RETRY_STATE["job_id"] = None
+    if _FETCH_RETRY_TIMER is not None:
+        try:
+            _FETCH_RETRY_TIMER.cancel()
+        except Exception:
+            pass
+    _FETCH_RETRY_TIMER = None
+
+
+def _schedule_fetch_retry(
+    *,
+    mode: str,
+    date_str: Optional[str],
+    force: bool,
+    delay_seconds: int,
+    reason: str,
+    error: Optional[str],
+    attempt: int = 1,
+    max_attempts: int = FETCH_RETRY_MAX_ATTEMPTS,
+) -> Dict[str, Any]:
+    global _FETCH_RETRY_TIMER
+    delay = max(1, min(int(delay_seconds or 1), FETCH_RETRY_MAX_DELAY_SECONDS))
+    now_dt = datetime.now()
+    due_at = now_dt + timedelta(seconds=delay)
+    run_mode = str(mode or "latest").strip().lower()
+    if run_mode not in {"latest", "date"}:
+        run_mode = "latest"
+
+    with _FETCH_RETRY_LOCK:
+        if _FETCH_RETRY_TIMER is not None:
+            try:
+                _FETCH_RETRY_TIMER.cancel()
+            except Exception:
+                pass
+            _FETCH_RETRY_TIMER = None
+
+        job_id = uuid.uuid4().hex
+        _FETCH_RETRY_STATE.update(
+            {
+                "job_id": job_id,
+                "status": "scheduled",
+                "mode": run_mode,
+                "date": str(date_str).strip() if date_str else None,
+                "force": bool(force),
+                "attempt": max(1, int(attempt)),
+                "max_attempts": max(1, int(max_attempts or FETCH_RETRY_MAX_ATTEMPTS)),
+                "reason": str(reason or "retry"),
+                "scheduled_at": now_dt.isoformat(),
+                "due_at": due_at.isoformat(),
+                "started_at": None,
+                "completed_at": None,
+                "last_error": str(error or "") or None,
+                "last_result": None,
+            }
+        )
+        timer = threading.Timer(delay, _run_scheduled_fetch_retry, args=(job_id,))
+        timer.daemon = True
+        _FETCH_RETRY_TIMER = timer
+        timer.start()
+        return _fetch_retry_payload_locked(now_dt=now_dt)
+
+
+def _run_fetch_request_once(
+    *,
+    mode: str,
+    date_str: Optional[str],
+    force: bool,
+) -> Dict[str, Any]:
+    run_mode = str(mode or "latest").strip().lower()
+    if run_mode == "date":
+        return _fetch_service.run_daily_fetch(date_str=date_str, force=bool(force))
+
+    if not _fetch_service.start_pipeline():
+        return {"skipped": True, "reason": "fetch_in_progress", "date": date_str or datetime.now().date().isoformat()}
+
+    try:
+        if date_str:
+            papers = client.fetch_papers_by_date(date_str)
+            batch_date = date_str
+        else:
+            papers, batch_date = client.fetch_latest_daily_batch()
+        result = _handle_fetched_papers(papers, batch_date)
+        result["skipped"] = False
+        return result
+    except Exception:
+        _fetch_service.end_pipeline()
+        raise
+
+
+def _run_scheduled_fetch_retry(job_id: str) -> None:
+    with _FETCH_RETRY_LOCK:
+        if str(_FETCH_RETRY_STATE.get("job_id") or "") != str(job_id):
+            return
+        if _FETCH_RETRY_STATE.get("status") != "scheduled":
+            return
+        mode = str(_FETCH_RETRY_STATE.get("mode") or "latest")
+        date_str = _FETCH_RETRY_STATE.get("date")
+        force = bool(_FETCH_RETRY_STATE.get("force"))
+        attempt = max(1, int(_FETCH_RETRY_STATE.get("attempt") or 1))
+        max_attempts = max(1, int(_FETCH_RETRY_STATE.get("max_attempts") or FETCH_RETRY_MAX_ATTEMPTS))
+        _FETCH_RETRY_STATE["status"] = "running"
+        _FETCH_RETRY_STATE["started_at"] = datetime.now().isoformat()
+        _FETCH_RETRY_STATE["last_error"] = None
+        _FETCH_RETRY_STATE["due_at"] = None
+
+    start_ts = time.perf_counter()
+    try:
+        result = _run_fetch_request_once(mode=mode, date_str=date_str, force=force)
+        if "error" in result:
+            raise _ScheduledFetchError(
+                str(result.get("error") or "fetch retry failed"),
+                status_code=int(result.get("status_code") or 0),
+                retry_after_seconds=int(result.get("retry_after_seconds") or 0),
+            )
+        with _FETCH_RETRY_LOCK:
+            _mark_fetch_retry_terminal_locked(status="succeeded", result=result, completed_at=datetime.now().isoformat())
+        _log_request_timing(
+            "fetch.retry",
+            start_ts,
+            status="ok",
+            mode=mode,
+            date=result.get("date") or date_str,
+            fetched=int(result.get("fetched") or 0),
+            new_count=int(result.get("new") or 0),
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+    except Exception as e:
+        error_text = str(e)
+        status_code = int(getattr(e, "status_code", 0) or 0)
+        retry_after_hint = int(getattr(e, "retry_after_seconds", 0) or 0)
+        retry_after = _infer_fetch_retry_delay_seconds(
+            error=error_text,
+            status_code=status_code,
+            retry_after_seconds=retry_after_hint,
+        )
+        if attempt < max_attempts and retry_after > 0:
+            next_state = _schedule_fetch_retry(
+                mode=mode,
+                date_str=date_str,
+                force=force,
+                delay_seconds=retry_after,
+                reason="auto_retry",
+                error=error_text,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+            )
+            _log_request_timing(
+                "fetch.retry",
+                start_ts,
+                status="error",
+                mode=mode,
+                date=date_str,
+                error=error_text,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                rescheduled=True,
+                retry_after_seconds=int(next_state.get("remaining_seconds") or retry_after),
+            )
+            return
+
+        with _FETCH_RETRY_LOCK:
+            _mark_fetch_retry_terminal_locked(status="failed", error=error_text, completed_at=datetime.now().isoformat())
+        _log_request_timing(
+            "fetch.retry",
+            start_ts,
+            status="error",
+            mode=mode,
+            date=date_str,
+            error=error_text,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            rescheduled=False,
+        )
+
+
+def _schedule_fetch_retry_from_failure(event: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    payload = event if isinstance(event, dict) else {}
+    mode = str(payload.get("mode") or "latest").strip().lower()
+    date_str = str(payload.get("date") or "").strip() or None
+    force = bool(payload.get("force"))
+    status_code = int(payload.get("status_code") or 0)
+    retry_after_seconds = int(payload.get("retry_after_seconds") or 0)
+    error_text = str(payload.get("error") or "")
+    attempt = max(1, int(payload.get("attempt") or 1))
+    max_attempts = max(1, int(payload.get("max_attempts") or FETCH_RETRY_MAX_ATTEMPTS))
+    reason = str(payload.get("reason") or "request_failure")
+
+    retry_delay = _infer_fetch_retry_delay_seconds(
+        error=error_text,
+        status_code=status_code,
+        retry_after_seconds=retry_after_seconds,
+    )
+    if retry_delay <= 0:
+        return None
+
+    return _schedule_fetch_retry(
+        mode=mode,
+        date_str=date_str,
+        force=force,
+        delay_seconds=retry_delay,
+        reason=reason,
+        error=error_text,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+
+
+def _get_fetch_status_payload() -> Dict[str, Any]:
+    with _FETCH_RETRY_LOCK:
+        retry_payload = _fetch_retry_payload_locked()
+    return {
+        "pipeline": _fetch_service.get_pipeline_state(),
+        "cooldown": client.get_rate_limit_status(),
+        "retry": retry_payload,
+    }
 
 def _enqueue_novelty_backfill(scores: Optional[Dict[str, float]]) -> None:
     global _NOVELTY_BACKFILL_ACTIVE
@@ -3646,22 +3970,21 @@ def _handle_fetched_papers(papers: List[Dict[str, Any]], batch_date: str) -> Dic
 
     ids = [p['id'] for p in papers]
     task_count = 0
-    with _FETCH_PIPELINE_LOCK:
-        pipeline_active = _FETCH_PIPELINE_ACTIVE
+    pipeline_active = _fetch_service.is_pipeline_active()
 
     if pipeline_active:
         if ids:
-            _track_fetch_task(enrich_citations, ids)
+            _fetch_service.track_task(enrich_citations, ids)
             task_count += 1
         if papers:
-            _track_fetch_task(background_index, papers)
+            _fetch_service.track_task(background_index, papers)
             task_count += 1
-            _track_fetch_task(enrich_structures, papers)
+            _fetch_service.track_task(enrich_structures, papers)
             task_count += 1
-            _track_fetch_task(generate_alerts_for_papers, papers)
+            _fetch_service.track_task(generate_alerts_for_papers, papers)
             task_count += 1
         if task_count == 0:
-            _end_fetch_pipeline()
+            _fetch_service.end_pipeline()
     else:
         if ids:
             threading.Thread(target=enrich_citations, args=(ids,), daemon=True).start()
@@ -3679,6 +4002,13 @@ def _handle_fetched_papers(papers: List[Dict[str, Any]], batch_date: str) -> Dic
         "version_alerts": version_alerts,
         "rules": rules_result,
     }
+
+
+_fetch_service = FetchService(
+    storage=storage,
+    client_module=client,
+    handle_fetched_papers=_handle_fetched_papers,
+)
 
 def _estimate_job_duration_seconds(job_type: str) -> float:
     with _JOB_LOCK:
@@ -3710,6 +4040,56 @@ def _log_event(event: str, level: str = "info", **fields: Any) -> None:
         print(line)
     _write_log_line(line)
 
+
+def _metric_bucket_for_event(event: str) -> Optional[str]:
+    ev = str(event or "")
+    if ev.startswith("request.fetch") or ev.startswith("fetch.retry"):
+        return "fetch"
+    if ev.startswith("request.inbox"):
+        return "inbox"
+    if ev.startswith("request.search"):
+        return "search"
+    return None
+
+
+def _record_request_metric(event: str, fields: Dict[str, Any]) -> None:
+    bucket = _metric_bucket_for_event(event)
+    if not bucket:
+        return
+
+    status = str(fields.get("status") or "").lower()
+    http_status = int(fields.get("http_status") or 0)
+    is_error = status == "error" or http_status >= 400
+    is_slow = bool(fields.get("slow"))
+    try:
+        duration_ms = max(0.0, float(fields.get("duration_ms") or 0.0))
+    except Exception:
+        duration_ms = 0.0
+
+    with _METRICS_LOCK:
+        metric = _REQUEST_METRICS.setdefault(
+            bucket,
+            {"requests": 0, "errors": 0, "slow": 0, "total_duration_ms": 0.0, "last_status": None, "last_at": None, "last_error": None},
+        )
+        metric["requests"] = int(metric.get("requests") or 0) + 1
+        metric["errors"] = int(metric.get("errors") or 0) + (1 if is_error else 0)
+        metric["slow"] = int(metric.get("slow") or 0) + (1 if is_slow else 0)
+        metric["total_duration_ms"] = float(metric.get("total_duration_ms") or 0.0) + duration_ms
+        metric["last_status"] = status or ("error" if is_error else "ok")
+        metric["last_at"] = datetime.now().isoformat()
+        if is_error:
+            metric["last_error"] = str(fields.get("error") or "")
+
+
+def _metrics_snapshot() -> Dict[str, Any]:
+    with _METRICS_LOCK:
+        raw = copy.deepcopy(_REQUEST_METRICS)
+    for _, item in raw.items():
+        requests_total = int(item.get("requests") or 0)
+        total_duration = float(item.get("total_duration_ms") or 0.0)
+        item["avg_duration_ms"] = round(total_duration / requests_total, 2) if requests_total > 0 else 0.0
+    return raw
+
 def _log_request_timing(event: str, start_ts: float, **fields: Any) -> None:
     duration = max(0.0, time.perf_counter() - start_ts)
     fields.setdefault("duration_ms", round(duration * 1000, 2))
@@ -3720,6 +4100,7 @@ def _log_request_timing(event: str, start_ts: float, **fields: Any) -> None:
         level = "error"
     elif fields.get("slow"):
         level = "warn"
+    _record_request_metric(event, fields)
     _log_event(event, level=level, **fields)
 
 def _write_log_line(line: str) -> None:
@@ -3836,44 +4217,6 @@ def _bump_api_cache_epochs(*keys: str):
     with _API_CACHE_LOCK:
         for key in keys:
             _API_CACHE_EPOCHS[key] = _API_CACHE_EPOCHS.get(key, 0) + 1
-
-def _start_fetch_pipeline() -> bool:
-    global _FETCH_PIPELINE_ACTIVE, _FETCH_PIPELINE_TASKS, _FETCH_PIPELINE_STARTED_AT
-    with _FETCH_PIPELINE_LOCK:
-        if _FETCH_PIPELINE_ACTIVE:
-            return False
-        _FETCH_PIPELINE_ACTIVE = True
-        _FETCH_PIPELINE_TASKS = 0
-        _FETCH_PIPELINE_STARTED_AT = datetime.now().isoformat()
-        return True
-
-def _end_fetch_pipeline():
-    global _FETCH_PIPELINE_ACTIVE, _FETCH_PIPELINE_TASKS, _FETCH_PIPELINE_STARTED_AT
-    with _FETCH_PIPELINE_LOCK:
-        _FETCH_PIPELINE_ACTIVE = False
-        _FETCH_PIPELINE_TASKS = 0
-        _FETCH_PIPELINE_STARTED_AT = None
-
-def _fetch_task_done():
-    global _FETCH_PIPELINE_ACTIVE, _FETCH_PIPELINE_TASKS, _FETCH_PIPELINE_STARTED_AT
-    with _FETCH_PIPELINE_LOCK:
-        _FETCH_PIPELINE_TASKS = max(0, _FETCH_PIPELINE_TASKS - 1)
-        if _FETCH_PIPELINE_TASKS <= 0:
-            _FETCH_PIPELINE_ACTIVE = False
-            _FETCH_PIPELINE_STARTED_AT = None
-
-def _track_fetch_task(fn, *args):
-    global _FETCH_PIPELINE_TASKS
-    with _FETCH_PIPELINE_LOCK:
-        _FETCH_PIPELINE_TASKS += 1
-
-    def _runner():
-        try:
-            fn(*args)
-        finally:
-            _fetch_task_done()
-
-    threading.Thread(target=_runner, daemon=True).start()
 
 def _queue_position_for_job(job_id: str) -> Optional[int]:
     with _JOB_QUEUE.mutex:
@@ -4425,54 +4768,6 @@ def _daily_fetch_due(now: datetime) -> bool:
     run = storage.get_daily_fetch_run(now.date().isoformat())
     return not run or run.get("status") != "success"
 
-def _run_daily_fetch(date_str: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
-    storage.init_db()
-    if not date_str:
-        date_str = datetime.now().date().isoformat()
-    if not force:
-        run = storage.get_daily_fetch_run(date_str)
-        if run and run.get("status") == "success":
-            return {"skipped": True, "reason": "already_fetched", "date": date_str}
-    if not _start_fetch_pipeline():
-        return {"skipped": True, "reason": "fetch_in_progress", "date": date_str}
-    try:
-        papers = client.fetch_papers_by_date(date_str)
-        result = _handle_fetched_papers(papers, date_str)
-        storage.record_daily_fetch_run(
-            date_str,
-            status="success",
-            fetched=int(result.get("fetched") or 0),
-            new_count=int(result.get("new") or 0),
-            forced=bool(force),
-        )
-        result["skipped"] = False
-        return result
-    except client.ArxivRateLimitError as e:
-        retry_after = max(1, int(getattr(e, "retry_after_seconds", 60) or 60))
-        storage.record_daily_fetch_run(
-            date_str,
-            status="error",
-            reason=str(e),
-            forced=bool(force),
-        )
-        _end_fetch_pipeline()
-        return {
-            "skipped": False,
-            "error": str(e),
-            "status_code": 429,
-            "retry_after_seconds": retry_after,
-            "date": date_str,
-        }
-    except Exception as e:
-        storage.record_daily_fetch_run(
-            date_str,
-            status="error",
-            reason=str(e),
-            forced=bool(force),
-        )
-        _end_fetch_pipeline()
-        return {"skipped": False, "error": str(e), "date": date_str}
-
 def _daily_fetch_loop():
     is_leader = False
     while not _SCHEDULER_STOP_EVENT.is_set():
@@ -4494,7 +4789,7 @@ def _daily_fetch_loop():
 
             now = datetime.now()
             if _daily_fetch_due(now):
-                result = _run_daily_fetch(now.date().isoformat(), force=False)
+                result = _fetch_service.run_daily_fetch(now.date().isoformat(), force=False)
                 print(f"Daily fetch result: {result}")
 
             if _SCHEDULER_STOP_EVENT.wait(DAILY_FETCH_POLL_SEC):
@@ -4704,14 +4999,6 @@ def enrich_citations(paper_ids: List[str]):
         generate_alerts_for_papers(papers)
         print(f"Updated citations for {len(counts)} papers.")
 
-def _get_fetch_pipeline_state() -> Dict[str, Any]:
-    with _FETCH_PIPELINE_LOCK:
-        return {
-            "active": bool(_FETCH_PIPELINE_ACTIVE),
-            "tasks": int(_FETCH_PIPELINE_TASKS or 0),
-            "started_at": _FETCH_PIPELINE_STARTED_AT,
-        }
-
 app.include_router(
     create_read_ops_router(
         storage=storage,
@@ -4724,126 +5011,9 @@ app.include_router(
         job_lock=_JOB_LOCK,
         jobs_ref=_JOBS,
         job_queue=_JOB_QUEUE,
-        fetch_pipeline_state=_get_fetch_pipeline_state,
+        fetch_pipeline_state=_fetch_service.get_pipeline_state,
     )
 )
-
-@app.post("/api/fetch")
-def api_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
-    storage.init_db()
-    start_ts = time.perf_counter()
-    if not _start_fetch_pipeline():
-        started_at = None
-        with _FETCH_PIPELINE_LOCK:
-            started_at = _FETCH_PIPELINE_STARTED_AT
-        detail = "Fetch already running."
-        if started_at:
-            detail = f"Fetch already running (started at {started_at})."
-        raise HTTPException(status_code=409, detail=detail)
-    try:
-        if req.date:
-            papers = client.fetch_papers_by_date(req.date)
-            batch_date = req.date
-        else:
-            # Ignore req.max_results, we fetch the whole day day
-            papers, batch_date = client.fetch_latest_daily_batch()
-        result = _handle_fetched_papers(papers, batch_date)
-        if req.date:
-            storage.record_daily_fetch_run(
-                batch_date,
-                status="success",
-                fetched=int(result.get("fetched") or 0),
-                new_count=int(result.get("new") or 0),
-                forced=True,
-            )
-        _log_request_timing(
-            "request.fetch",
-            start_ts,
-            status="ok",
-            fetched=int(result.get("fetched") or 0),
-            new_count=int(result.get("new") or 0),
-            date=batch_date,
-        )
-        return result
-    except client.ArxivRateLimitError as e:
-        _end_fetch_pipeline()
-        retry_after = max(1, int(getattr(e, "retry_after_seconds", 60) or 60))
-        _log_request_timing(
-            "request.fetch",
-            start_ts,
-            status="error",
-            error=str(e),
-            http_status=429,
-            retry_after=retry_after,
-        )
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-            content={"detail": str(e), "retry_after_seconds": retry_after},
-        )
-    except Exception as e:
-        _end_fetch_pipeline()
-        _log_request_timing("request.fetch", start_ts, status="error", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/fetch/daily")
-def run_daily_fetch(date: Optional[str] = None, force: bool = False):
-    """
-    Runs the daily fetch job for a specific date (YYYY-MM-DD).
-    If no date is provided, uses today's date. Mon-Fri guard applies unless force=True.
-    """
-    start_ts = time.perf_counter()
-    if date:
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except Exception:
-            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
-
-    if not force:
-        if date:
-            try:
-                date_dt = datetime.strptime(date, "%Y-%m-%d")
-                if date_dt.weekday() >= 5:
-                    return {"skipped": True, "reason": "weekend"}
-            except Exception:
-                raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
-        else:
-            now = datetime.now()
-            if now.weekday() >= 5:
-                return {"skipped": True, "reason": "weekend"}
-
-    result = _run_daily_fetch(date_str=date, force=force)
-    if "error" in result:
-        status_code = int(result.get("status_code") or 500)
-        retry_after = int(result.get("retry_after_seconds") or 0)
-        _log_request_timing(
-            "request.fetch_daily",
-            start_ts,
-            status="error",
-            error=str(result.get("error")),
-            date=result.get("date"),
-            forced=bool(force),
-            http_status=status_code,
-            retry_after=retry_after or None,
-        )
-        if status_code == 429 and retry_after > 0:
-            return JSONResponse(
-                status_code=429,
-                headers={"Retry-After": str(retry_after)},
-                content={"detail": result["error"], "retry_after_seconds": retry_after},
-            )
-        raise HTTPException(status_code=status_code, detail=result["error"])
-    _log_request_timing(
-        "request.fetch_daily",
-        start_ts,
-        status="ok" if not result.get("skipped") else "skipped",
-        fetched=int(result.get("fetched") or 0),
-        new_count=int(result.get("new") or 0),
-        date=result.get("date"),
-        reason=result.get("reason"),
-        forced=bool(force),
-    )
-    return result
 
 def _sanitize_day_run_options(options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     base = DayRunRequest().dict()
@@ -4963,10 +5133,24 @@ def _execute_day_run(payload: DayRunRequest, source: str = "api") -> Dict[str, A
             if not bool(payload.force) and weekend_policy == "skip" and target_dt.weekday() >= 5:
                 fetch_result = {"skipped": True, "reason": "weekend", "date": effective_date}
             else:
-                fetch_result = _run_daily_fetch(date_str=effective_date, force=bool(payload.force))
+                fetch_result = _fetch_service.run_daily_fetch(date_str=effective_date, force=bool(payload.force))
         except Exception as e:
             fetch_result = {"skipped": False, "error": str(e), "date": effective_date}
         if "error" in fetch_result:
+            retry_payload = _schedule_fetch_retry_from_failure(
+                {
+                    "mode": "date",
+                    "date": fetch_result.get("date") or effective_date,
+                    "force": bool(payload.force),
+                    "status_code": int(fetch_result.get("status_code") or 500),
+                    "retry_after_seconds": int(fetch_result.get("retry_after_seconds") or 0),
+                    "error": str(fetch_result.get("error") or ""),
+                    "reason": "day_run_fetch_error",
+                }
+            )
+            if retry_payload is not None:
+                fetch_result["retry"] = retry_payload
+                fetch_result["retry_scheduled"] = bool(retry_payload.get("active"))
             errors.append(f"fetch: {fetch_result.get('error')}")
     steps["fetch"] = fetch_result
 
@@ -5094,24 +5278,31 @@ def _execute_day_run(payload: DayRunRequest, source: str = "api") -> Dict[str, A
     response["run_id"] = int(run_id or 0)
     return response
 
-@app.post("/api/day/run")
-def run_day(req: Optional[DayRunRequest] = None):
-    storage.init_db()
-    start_ts = time.perf_counter()
-    payload = req or DayRunRequest()
-    response = _run_day_with_idempotency(payload, source="api")
-    fetch_result = response.get("fetch") or {}
-    _log_request_timing(
-        "request.day_run",
-        start_ts,
-        status=response.get("status") or ("skipped" if fetch_result.get("skipped") else "ok"),
-        fetched=int(fetch_result.get("fetched") or 0),
-        new_count=int(fetch_result.get("new") or 0),
-        date=response.get("date"),
-        inbox_total=int(response.get("inbox", {}).get("total") or 0),
-        run_id=int(response.get("run_id") or 0),
+app.include_router(
+    create_workflow_actions_router(
+        storage=storage,
+        client_module=client,
+        fetch_pipeline_state=_fetch_service.get_pipeline_state,
+        start_fetch_pipeline=_fetch_service.start_pipeline,
+        end_fetch_pipeline=_fetch_service.end_pipeline,
+        handle_fetched_papers=_handle_fetched_papers,
+        log_request_timing=_log_request_timing,
+        run_daily_fetch_internal=_fetch_service.run_daily_fetch,
+        sanitize_day_run_options=_sanitize_day_run_options,
+        run_day_with_idempotency=_run_day_with_idempotency,
+        apply_inbox_action_internal=_apply_inbox_action_internal,
+        normalize_inbox_kind=_normalize_inbox_kind,
+        default_inbox_action_for_kind=_default_inbox_action_for_kind,
+        FetchRequestModel=FetchRequest,
+        DayRunRequestModel=DayRunRequest,
+        DayRunPresetRequestModel=DayRunPresetRequest,
+        DayRunPresetUpdateRequestModel=DayRunPresetUpdateRequest,
+        InboxActionRequestModel=InboxActionRequest,
+        InboxBulkActionRequestModel=InboxBulkActionRequest,
+        schedule_fetch_retry=_schedule_fetch_retry_from_failure,
+        fetch_status_payload=_get_fetch_status_payload,
     )
-    return response
+)
 
 @app.get("/api/day/runs")
 def list_day_runs(limit: int = 30):
@@ -5125,71 +5316,19 @@ def list_day_run_presets(limit: int = 50):
     items = storage.list_day_run_presets(limit=limit)
     return {"count": len(items), "items": items}
 
-@app.post("/api/day/presets")
-def create_day_run_preset(req: DayRunPresetRequest):
-    storage.init_db()
-    name = str(req.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="name is required")
-    options = _sanitize_day_run_options(req.options or {})
-    created = storage.create_day_run_preset(
-        name=name,
-        description=(str(req.description or "").strip() or None),
-        options=options,
-    )
-    if not created:
-        raise HTTPException(status_code=500, detail="Failed to create preset")
-    return created
 
-@app.put("/api/day/presets/{preset_id}")
-def update_day_run_preset(preset_id: int, req: DayRunPresetUpdateRequest):
-    storage.init_db()
-    updates: Dict[str, Any] = {}
-    if req.name is not None:
-        updates["name"] = str(req.name or "").strip() or "Preset"
-    if req.description is not None:
-        updates["description"] = str(req.description or "").strip()
-    if req.options is not None:
-        updates["options"] = _sanitize_day_run_options(req.options)
-    if not updates:
-        raise HTTPException(status_code=400, detail="No updates provided")
-    updated = storage.update_day_run_preset(int(preset_id), updates)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Preset not found")
-    return updated
-
-@app.delete("/api/day/presets/{preset_id}")
-def delete_day_run_preset(preset_id: int):
-    storage.init_db()
-    ok = storage.delete_day_run_preset(int(preset_id))
-    return {"success": bool(ok)}
-
-@app.post("/api/day/presets/{preset_id}/run")
-def run_day_preset(preset_id: int):
-    storage.init_db()
-    preset = storage.get_day_run_preset(int(preset_id))
-    if not preset:
-        raise HTTPException(status_code=404, detail="Preset not found")
-    options = preset.get("options") or {}
-    payload = DayRunRequest(**_sanitize_day_run_options(options))
-    response = _run_day_with_idempotency(payload, source=f"preset:{int(preset_id)}")
-    storage.mark_day_run_preset_used(int(preset_id))
-    response["preset_id"] = int(preset_id)
-    return response
-
-@app.post("/api/day/run/{run_id}/retry")
-def retry_day_run(run_id: int):
-    storage.init_db()
-    record = storage.get_day_run_history(run_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Run history not found")
-    options = record.get("options") or {}
-    if not isinstance(options, dict):
-        options = {}
-    payload = DayRunRequest(**_sanitize_day_run_options(options))
-    response = _run_day_with_idempotency(payload, source=f"retry:{int(run_id)}")
-    response["retry_of"] = int(run_id)
-    return response
+@app.get("/api/metrics")
+def get_metrics():
+    now_dt = datetime.now()
+    started_dt = _parse_iso_datetime(_METRICS_STARTED_AT) or now_dt
+    uptime_seconds = max(0, int((now_dt - started_dt).total_seconds()))
+    return {
+        "started_at": _METRICS_STARTED_AT,
+        "as_of": now_dt.isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "requests": _metrics_snapshot(),
+        "fetch_status": _get_fetch_status_payload(),
+    }
 
 @app.get("/api/papers")
 def get_papers(
@@ -5540,48 +5679,67 @@ def api_search(
 @app.get("/api/search/global")
 def api_search_global(q: str):
     """Searches global ArXiv and saves results temporarily to DB."""
+    start_ts = time.perf_counter()
     if not q:
+        _log_request_timing("request.search_global", start_ts, status="empty_query", query_len=0, results=0)
         return []
-        
-    print(f"DEBUG: Global Search for '{q}'")
-    papers = client.search_archive(q, max_results=20)
-    
-    # Save these papers to DB so they have IDs, can be bookmarked/rated
-    # Note: save_papers updates if exists, inserts if new.
-    # It sets status='new' by default if new.
-    # We might not want to flood 'new' feed?
-    # Actually client.fetch_latest_daily_batch does the same.
-    # But usually 'new' feed is date sorted. These old papers will be buried or appear interspersed?
-    # get_papers sort by date defaults so they might appear if they are new?
-    # No, get_papers filters by date if 'new' status.
-    # If we fetch an old paper (2017), it will be saved with status 'new'.
-    # But get_papers(status='new') won't show it unless date picker is set to 2017 or cleared?
-    # Let's just save them.
-    storage.save_papers(papers)
-    
-    # We return them directly to front-end
-    # But we should enrich them/check if they are already bookmarked/liked in DB?
-    # get_papers_by_ids handles that?
-    # Let's re-fetch from DB to ensure consistency (and getting standard fields)
-    ids = [p['id'] for p in papers]
-    
-    # Re-fetch to get 'bookmarked', 'score', etc properties if they existed
-    db_papers = storage.get_papers_by_ids(ids)
-    db_papers = _attach_version_metadata(db_papers, dedupe_latest=False)
-    _attach_version_notes(db_papers)
-    _attach_version_change_fields(db_papers)
-    _attach_match_reasons(db_papers)
-    _attach_reading_meta(db_papers)
-    _attach_labels(db_papers)
-    _attach_pins(db_papers)
-    
-    # Inject search snippet equivalent (Abstract)
-    for p in db_papers:
-        # Highlight matches in title/summary?
-        # For now just return as is.
-        pass
-        
-    return db_papers
+
+    try:
+        print(f"DEBUG: Global Search for '{q}'")
+        papers = client.search_archive(q, max_results=20)
+
+        # Save these papers to DB so they have IDs, can be bookmarked/rated
+        # Note: save_papers updates if exists, inserts if new.
+        # It sets status='new' by default if new.
+        # We might not want to flood 'new' feed?
+        # Actually client.fetch_latest_daily_batch does the same.
+        # But usually 'new' feed is date sorted. These old papers will be buried or appear interspersed?
+        # get_papers sort by date defaults so they might appear if they are new?
+        # No, get_papers filters by date if 'new' status.
+        # If we fetch an old paper (2017), it will be saved with status 'new'.
+        # But get_papers(status='new') won't show it unless date picker is set to 2017 or cleared?
+        # Let's just save them.
+        storage.save_papers(papers)
+
+        # We return them directly to front-end
+        # But we should enrich them/check if they are already bookmarked/liked in DB?
+        # get_papers_by_ids handles that?
+        # Let's re-fetch from DB to ensure consistency (and getting standard fields)
+        ids = [p['id'] for p in papers]
+
+        # Re-fetch to get 'bookmarked', 'score', etc properties if they existed
+        db_papers = storage.get_papers_by_ids(ids)
+        db_papers = _attach_version_metadata(db_papers, dedupe_latest=False)
+        _attach_version_notes(db_papers)
+        _attach_version_change_fields(db_papers)
+        _attach_match_reasons(db_papers)
+        _attach_reading_meta(db_papers)
+        _attach_labels(db_papers)
+        _attach_pins(db_papers)
+
+        # Inject search snippet equivalent (Abstract)
+        for p in db_papers:
+            # Highlight matches in title/summary?
+            # For now just return as is.
+            pass
+
+        _log_request_timing(
+            "request.search_global",
+            start_ts,
+            status="ok",
+            query_len=len(q or ""),
+            results=len(db_papers),
+        )
+        return db_papers
+    except Exception as e:
+        _log_request_timing(
+            "request.search_global",
+            start_ts,
+            status="error",
+            error=str(e),
+            query_len=len(q or ""),
+        )
+        raise
 
 @app.post("/api/fts/rebuild")
 def rebuild_fts():
@@ -7625,15 +7783,36 @@ def get_unified_inbox(
     sort: str = "recent",
 ):
     storage.init_db()
+    start_ts = time.perf_counter()
     kind_list = _parse_inbox_kind_list(kinds)
-    return _build_unified_inbox_payload(
-        limit=limit,
-        version_scope=version_scope,
-        version_days=version_days,
-        kinds=kind_list,
-        include_items=True,
-        sort_by=sort,
-    )
+    try:
+        payload = _build_unified_inbox_payload(
+            limit=limit,
+            version_scope=version_scope,
+            version_days=version_days,
+            kinds=kind_list,
+            include_items=True,
+            sort_by=sort,
+        )
+        _log_request_timing(
+            "request.inbox.unified",
+            start_ts,
+            status="ok",
+            total=int(payload.get("total") or 0),
+            kinds=",".join(kind_list),
+            limit=int(limit),
+        )
+        return payload
+    except Exception as e:
+        _log_request_timing(
+            "request.inbox.unified",
+            start_ts,
+            status="error",
+            error=str(e),
+            kinds=",".join(kind_list),
+            limit=int(limit),
+        )
+        raise
 
 @app.get("/api/inbox/focus")
 def get_unified_inbox_focus(
@@ -7643,23 +7822,44 @@ def get_unified_inbox_focus(
     kinds: Optional[str] = None,
 ):
     storage.init_db()
+    start_ts = time.perf_counter()
     focus_limit = max(1, min(int(limit or 12), 80))
     kind_list = _parse_inbox_kind_list(kinds)
     seed_limit = max(30, min(200, focus_limit * 6))
-    payload = _build_unified_inbox_payload(
-        limit=seed_limit,
-        version_scope=version_scope,
-        version_days=version_days,
-        kinds=kind_list,
-        include_items=True,
-        sort_by="priority",
-    )
-    items = list(payload.get("items") or [])[:focus_limit]
-    payload["items"] = items
-    payload["count"] = len(items)
-    payload["focus_limit"] = focus_limit
-    payload["mode"] = "focus"
-    return payload
+    try:
+        payload = _build_unified_inbox_payload(
+            limit=seed_limit,
+            version_scope=version_scope,
+            version_days=version_days,
+            kinds=kind_list,
+            include_items=True,
+            sort_by="priority",
+        )
+        items = list(payload.get("items") or [])[:focus_limit]
+        payload["items"] = items
+        payload["count"] = len(items)
+        payload["focus_limit"] = focus_limit
+        payload["mode"] = "focus"
+        _log_request_timing(
+            "request.inbox.focus",
+            start_ts,
+            status="ok",
+            total=int(payload.get("total") or 0),
+            count=int(payload.get("count") or 0),
+            kinds=",".join(kind_list),
+            focus_limit=focus_limit,
+        )
+        return payload
+    except Exception as e:
+        _log_request_timing(
+            "request.inbox.focus",
+            start_ts,
+            status="error",
+            error=str(e),
+            kinds=",".join(kind_list),
+            focus_limit=focus_limit,
+        )
+        raise
 
 
 @app.get("/api/inbox/count")
@@ -7669,84 +7869,41 @@ def get_unified_inbox_count(
     kinds: Optional[str] = None,
 ):
     storage.init_db()
+    start_ts = time.perf_counter()
     kind_list = _parse_inbox_kind_list(kinds)
-    payload = _build_unified_inbox_payload(
-        limit=1,
-        version_scope=version_scope,
-        version_days=version_days,
-        kinds=kind_list,
-        include_items=False,
-    )
-    return {
-        "total": int(payload.get("total") or 0),
-        "counts": payload.get("counts") or {},
-        "version_scope": payload.get("version_scope"),
-        "version_since": payload.get("version_since"),
-        "kinds": payload.get("kinds") or kind_list,
-    }
+    try:
+        payload = _build_unified_inbox_payload(
+            limit=1,
+            version_scope=version_scope,
+            version_days=version_days,
+            kinds=kind_list,
+            include_items=False,
+        )
+        result = {
+            "total": int(payload.get("total") or 0),
+            "counts": payload.get("counts") or {},
+            "version_scope": payload.get("version_scope"),
+            "version_since": payload.get("version_since"),
+            "kinds": payload.get("kinds") or kind_list,
+        }
+        _log_request_timing(
+            "request.inbox.count",
+            start_ts,
+            status="ok",
+            total=int(result.get("total") or 0),
+            kinds=",".join(kind_list),
+        )
+        return result
+    except Exception as e:
+        _log_request_timing(
+            "request.inbox.count",
+            start_ts,
+            status="error",
+            error=str(e),
+            kinds=",".join(kind_list),
+        )
+        raise
 
-
-@app.post("/api/inbox/action")
-def apply_unified_inbox_action(req: InboxActionRequest):
-    storage.init_db()
-    return _apply_inbox_action_internal(req)
-
-@app.post("/api/inbox/bulk-action")
-def apply_unified_inbox_bulk_action(req: InboxBulkActionRequest):
-    storage.init_db()
-    items = list(req.items or [])
-    if not items:
-        raise HTTPException(status_code=400, detail="items is required")
-    if len(items) > 500:
-        raise HTTPException(status_code=400, detail="items max length is 500")
-
-    shared_action = str(req.action or "").strip().lower() or None
-    shared_snooze = max(1, min(int(req.snooze_days or 3), 90))
-    shared_note = req.note
-    success_count = 0
-    failure_count = 0
-    results: List[Dict[str, Any]] = []
-
-    for item in items:
-        kind = _normalize_inbox_kind(item.kind)
-        action = str(item.action or shared_action or _default_inbox_action_for_kind(kind)).strip().lower()
-        snooze_days = max(1, min(int(item.snooze_days or shared_snooze), 90))
-        try:
-            payload = InboxActionRequest(
-                kind=kind,
-                action=action,
-                alert_id=item.alert_id,
-                follow_id=item.follow_id,
-                digest_id=item.digest_id,
-                paper_id=item.paper_id,
-                arxiv_base_id=item.arxiv_base_id,
-                snooze_days=snooze_days,
-                note=item.note or shared_note,
-            )
-            result = _apply_inbox_action_internal(payload)
-            success_count += 1
-            results.append({"success": True, "kind": kind, "action": action, "result": result})
-        except HTTPException as e:
-            failure_count += 1
-            results.append(
-                {
-                    "success": False,
-                    "kind": kind,
-                    "action": action,
-                    "status_code": int(e.status_code),
-                    "error": str(e.detail),
-                }
-            )
-        except Exception as e:
-            failure_count += 1
-            results.append({"success": False, "kind": kind, "action": action, "status_code": 500, "error": str(e)})
-
-    return {
-        "success_count": success_count,
-        "failure_count": failure_count,
-        "total": len(items),
-        "results": results,
-    }
 
 @app.get("/api/papers/{paper_id:path}/versions")
 def get_paper_versions(paper_id: str):
