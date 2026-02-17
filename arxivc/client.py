@@ -4,13 +4,16 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import arxiv
-import requests
+import requests  # type: ignore[import-untyped]
 
 from . import config
 
-
-ARXIV_PAGE_SIZE = max(20, min(int(os.environ.get("ARXIVC_ARXIV_PAGE_SIZE", "100") or 100), 2000))
-ARXIV_DELAY_SECONDS = max(0.0, float(os.environ.get("ARXIVC_ARXIV_DELAY_SECONDS", "3.0") or 3.0))
+ARXIV_PAGE_SIZE = max(
+    20, min(int(os.environ.get("ARXIVC_ARXIV_PAGE_SIZE", "100") or 100), 2000)
+)
+ARXIV_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("ARXIVC_ARXIV_DELAY_SECONDS", "3.0") or 3.0)
+)
 ARXIV_NUM_RETRIES = max(0, int(os.environ.get("ARXIVC_ARXIV_NUM_RETRIES", "2") or 2))
 ARXIV_REQUEST_TIMEOUT_SECONDS = max(
     2.0, float(os.environ.get("ARXIVC_ARXIV_TIMEOUT_SECONDS", "30.0") or 30.0)
@@ -50,11 +53,11 @@ class _ResilientArxivClient(arxiv.Client):
     This keeps retries at the page level instead of restarting the whole fetch.
     """
 
-    def _parse_feed(
-        self, url: str, first_page: bool = True, _try_index: int = 0
-    ):
+    def _parse_feed(self, url: str, first_page: bool = True, _try_index: int = 0):
         try:
-            return self._Client__try_parse_feed(url, first_page=first_page, try_index=_try_index)
+            return self._Client__try_parse_feed(
+                url, first_page=first_page, try_index=_try_index
+            )
         except (
             arxiv.HTTPError,
             arxiv.UnexpectedEmptyPageError,
@@ -63,7 +66,9 @@ class _ResilientArxivClient(arxiv.Client):
         ) as err:
             if _try_index < self.num_retries:
                 arxiv.logger.debug("Got error (try %d): %s", _try_index, err)
-                return self._parse_feed(url, first_page=first_page, _try_index=_try_index + 1)
+                return self._parse_feed(
+                    url, first_page=first_page, _try_index=_try_index + 1
+                )
             arxiv.logger.debug("Giving up (try %d): %s", _try_index, err)
             raise err
 
@@ -176,7 +181,9 @@ def _with_arxiv_client(op: Callable[[arxiv.Client], T]) -> T:
         except arxiv.HTTPError as err:
             status = int(getattr(err, "status", 0) or 0)
             if status == 429:
-                wait = _set_rate_limit_cooldown(_parse_retry_after_seconds(err) or ARXIV_RATE_LIMIT_COOLDOWN_SECONDS)
+                wait = _set_rate_limit_cooldown(
+                    _parse_retry_after_seconds(err) or ARXIV_RATE_LIMIT_COOLDOWN_SECONDS
+                )
                 raise ArxivRateLimitError(
                     f"arXiv API returned HTTP 429 (rate limit). Retry in about {wait}s.",
                     retry_after_seconds=wait,
@@ -191,18 +198,19 @@ def _with_arxiv_client(op: Callable[[arxiv.Client], T]) -> T:
         except requests.exceptions.RequestException as err:
             raise RuntimeError(f"arXiv request failed: {err}") from err
 
+
 def fetch_papers(max_results: int = config.MAX_RESULTS) -> List[Dict[str, Any]]:
     """
     Fetches recent papers from the configured categories.
     """
     # Construct query: cat:astro-ph OR cat:gr-qc ...
     query = " OR ".join([f"cat:{cat}" for cat in config.CATEGORIES])
-    
+
     search = arxiv.Search(
         query=query,
         max_results=max_results,
         sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending
+        sort_order=arxiv.SortOrder.Descending,
     )
 
     def _run(api_client: arxiv.Client) -> List[Dict[str, Any]]:
@@ -213,6 +221,7 @@ def fetch_papers(max_results: int = config.MAX_RESULTS) -> List[Dict[str, Any]]:
 
     return _with_arxiv_client(_run)
 
+
 def fetch_latest_daily_batch() -> tuple[List[Dict[str, Any]], str]:
     """
     Fetches ALL papers from the most recent active day on ArXiv.
@@ -222,9 +231,9 @@ def fetch_latest_daily_batch() -> tuple[List[Dict[str, Any]], str]:
     query = " OR ".join([f"cat:{cat}" for cat in config.CATEGORIES])
     search = arxiv.Search(
         query=query,
-        max_results=10, # Get just a few to find the date
+        max_results=10,  # Get just a few to find the date
         sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending
+        sort_order=arxiv.SortOrder.Descending,
     )
 
     def _run(api_client: arxiv.Client) -> tuple[List[Dict[str, Any]], str]:
@@ -259,6 +268,7 @@ def fetch_latest_daily_batch() -> tuple[List[Dict[str, Any]], str]:
 
     return _with_arxiv_client(_run)
 
+
 def fetch_papers_by_date(date_str: str) -> List[Dict[str, Any]]:
     """
     Fetches papers submitted on a specific date (YYYY-MM-DD).
@@ -268,20 +278,20 @@ def fetch_papers_by_date(date_str: str) -> List[Dict[str, Any]]:
     d = datetime.strptime(date_str, "%Y-%m-%d").date()
     # Query previous day
     query_d = d - timedelta(days=1)
-    
+
     start = query_d.strftime("%Y%m%d0000")
     end = query_d.strftime("%Y%m%d2359")
-    
+
     # Query: (cat:A OR cat:B) AND submittedDate:[start TO end]
     cat_query = " OR ".join([f"cat:{cat}" for cat in config.CATEGORIES])
     query = f"({cat_query}) AND submittedDate:[{start} TO {end}]"
-    
+
     # max_results=None ensures we get ALL pages for this date query
     search = arxiv.Search(
         query=query,
         max_results=None,
         sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending
+        sort_order=arxiv.SortOrder.Descending,
     )
 
     def _run(api_client: arxiv.Client) -> List[Dict[str, Any]]:
@@ -292,6 +302,7 @@ def fetch_papers_by_date(date_str: str) -> List[Dict[str, Any]]:
 
     return _with_arxiv_client(_run)
 
+
 def search_archive(query: str, max_results: int = 50) -> List[Dict[str, Any]]:
     """
     Searches the global ArXiv database (titles, authors, abstracts).
@@ -301,7 +312,7 @@ def search_archive(query: str, max_results: int = 50) -> List[Dict[str, Any]]:
         query=query,
         max_results=max_results,
         sort_by=arxiv.SortCriterion.Relevance,
-        sort_order=arxiv.SortOrder.Descending
+        sort_order=arxiv.SortOrder.Descending,
     )
 
     def _run(api_client: arxiv.Client) -> List[Dict[str, Any]]:

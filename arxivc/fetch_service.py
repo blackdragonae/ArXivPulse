@@ -69,7 +69,9 @@ class FetchService:
                 self._pipeline_active = False
                 self._pipeline_started_at = None
 
-    def run_daily_fetch(self, date_str: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+    def run_daily_fetch(
+        self, date_str: Optional[str] = None, force: bool = False
+    ) -> Dict[str, Any]:
         self._storage.init_db()
         if not date_str:
             date_str = datetime.now().date().isoformat()

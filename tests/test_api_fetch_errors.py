@@ -76,7 +76,9 @@ class StubClientModule:
         if self.mode == "ok":
             return ([{"id": "http://arxiv.org/abs/2602.99991v1"}], "2026-02-12")
         if self.mode == "rate_limit":
-            raise self.ArxivRateLimitError("arXiv API returned HTTP 429 (rate limit).", retry_after_seconds=17)
+            raise self.ArxivRateLimitError(
+                "arXiv API returned HTTP 429 (rate limit).", retry_after_seconds=17
+            )
         if self.mode == "timeout":
             raise RuntimeError("arXiv request timed out after 20s (retries=1).")
         raise RuntimeError("unexpected fetch failure")
@@ -85,7 +87,9 @@ class StubClientModule:
         if self.mode == "ok":
             return [{"id": f"http://arxiv.org/abs/{date_str.replace('-', '')}.00001v1"}]
         if self.mode == "rate_limit":
-            raise self.ArxivRateLimitError("arXiv API returned HTTP 429 (rate limit).", retry_after_seconds=17)
+            raise self.ArxivRateLimitError(
+                "arXiv API returned HTTP 429 (rate limit).", retry_after_seconds=17
+            )
         if self.mode == "timeout":
             raise RuntimeError("arXiv request timed out after 20s (retries=1).")
         raise RuntimeError("unexpected fetch failure")
@@ -326,7 +330,11 @@ def test_fetch_status_endpoint_exposes_pipeline_and_retry_payload():
     client, _, _, _ = _build_test_client(
         fetch_status_response={
             "pipeline": {"active": False, "tasks": 0, "started_at": None},
-            "cooldown": {"active": True, "retry_after_seconds": 12, "until": "2026-02-16T12:00:00"},
+            "cooldown": {
+                "active": True,
+                "retry_after_seconds": 12,
+                "until": "2026-02-16T12:00:00",
+            },
             "retry": {"status": "scheduled", "active": True, "remaining_seconds": 17},
         }
     )

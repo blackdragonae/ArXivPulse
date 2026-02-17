@@ -27,7 +27,9 @@ def create_workflow_actions_router(
     DayRunPresetUpdateRequestModel: Any,
     InboxActionRequestModel: Any,
     InboxBulkActionRequestModel: Any,
-    schedule_fetch_retry: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    schedule_fetch_retry: Optional[
+        Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+    ] = None,
     fetch_status_payload: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> APIRouter:
     """
@@ -113,7 +115,10 @@ def create_workflow_actions_router(
                 retry_after=retry_after,
                 retry_scheduled=bool(retry_payload),
             )
-            content: Dict[str, Any] = {"detail": str(e), "retry_after_seconds": retry_after}
+            content: Dict[str, Any] = {
+                "detail": str(e),
+                "retry_after_seconds": retry_after,
+            }
             if retry_payload is not None:
                 content["retry"] = retry_payload
                 content["retry_scheduled"] = bool(retry_payload.get("active"))
@@ -150,7 +155,9 @@ def create_workflow_actions_router(
                         "detail": str(e),
                         "retry": retry_payload,
                         "retry_scheduled": bool(retry_payload.get("active")),
-                        "retry_after_seconds": int(retry_payload.get("remaining_seconds") or 0),
+                        "retry_after_seconds": int(
+                            retry_payload.get("remaining_seconds") or 0
+                        ),
                     },
                 )
             raise HTTPException(status_code=500, detail=str(e))
@@ -175,13 +182,15 @@ def create_workflow_actions_router(
                     if date_dt.weekday() >= 5:
                         return {"skipped": True, "reason": "weekend"}
                 except Exception:
-                    raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+                    raise HTTPException(
+                        status_code=400, detail="date must be YYYY-MM-DD"
+                    )
             else:
                 now = datetime.now()
                 if now.weekday() >= 5:
                     return {"skipped": True, "reason": "weekend"}
 
-        result = run_daily_fetch_internal(date_str=date, force=force)
+        result = run_daily_fetch_internal(date, force)
         if "error" in result:
             status_code = int(result.get("status_code") or 500)
             retry_after = int(result.get("retry_after_seconds") or 0)
@@ -210,7 +219,10 @@ def create_workflow_actions_router(
                 retry_scheduled=bool(retry_payload),
             )
             if status_code == 429 and retry_after > 0:
-                content: Dict[str, Any] = {"detail": result["error"], "retry_after_seconds": retry_after}
+                content: Dict[str, Any] = {
+                    "detail": result["error"],
+                    "retry_after_seconds": retry_after,
+                }
                 if retry_payload is not None:
                     content["retry"] = retry_payload
                     content["retry_scheduled"] = bool(retry_payload.get("active"))
@@ -226,7 +238,9 @@ def create_workflow_actions_router(
                         "detail": str(result["error"]),
                         "retry": retry_payload,
                         "retry_scheduled": bool(retry_payload.get("active")),
-                        "retry_after_seconds": int(retry_payload.get("remaining_seconds") or 0),
+                        "retry_after_seconds": int(
+                            retry_payload.get("remaining_seconds") or 0
+                        ),
                     },
                 )
             raise HTTPException(status_code=status_code, detail=result["error"])
@@ -247,12 +261,13 @@ def create_workflow_actions_router(
         storage.init_db()
         start_ts = time.perf_counter()
         payload = req or DayRunRequestModel()
-        response = run_day_with_idempotency(payload, source="api")
+        response = run_day_with_idempotency(payload, "api")
         fetch_result = response.get("fetch") or {}
         log_request_timing(
             "request.day_run",
             start_ts,
-            status=response.get("status") or ("skipped" if fetch_result.get("skipped") else "ok"),
+            status=response.get("status")
+            or ("skipped" if fetch_result.get("skipped") else "ok"),
             fetched=int(fetch_result.get("fetched") or 0),
             new_count=int(fetch_result.get("new") or 0),
             date=response.get("date"),
@@ -308,7 +323,7 @@ def create_workflow_actions_router(
             raise HTTPException(status_code=404, detail="Preset not found")
         options = preset.get("options") or {}
         payload = DayRunRequestModel(**sanitize_day_run_options(options))
-        response = run_day_with_idempotency(payload, source=f"preset:{int(preset_id)}")
+        response = run_day_with_idempotency(payload, f"preset:{int(preset_id)}")
         storage.mark_day_run_preset_used(int(preset_id))
         response["preset_id"] = int(preset_id)
         return response
@@ -323,7 +338,7 @@ def create_workflow_actions_router(
         if not isinstance(options, dict):
             options = {}
         payload = DayRunRequestModel(**sanitize_day_run_options(options))
-        response = run_day_with_idempotency(payload, source=f"retry:{int(run_id)}")
+        response = run_day_with_idempotency(payload, f"retry:{int(run_id)}")
         response["retry_of"] = int(run_id)
         return response
 
@@ -370,10 +385,22 @@ def create_workflow_actions_router(
         start_ts = time.perf_counter()
         items = list(req.items or [])
         if not items:
-            log_request_timing("request.inbox.bulk_action", start_ts, status="error", error="items is required", http_status=400)
+            log_request_timing(
+                "request.inbox.bulk_action",
+                start_ts,
+                status="error",
+                error="items is required",
+                http_status=400,
+            )
             raise HTTPException(status_code=400, detail="items is required")
         if len(items) > 500:
-            log_request_timing("request.inbox.bulk_action", start_ts, status="error", error="items max length is 500", http_status=400)
+            log_request_timing(
+                "request.inbox.bulk_action",
+                start_ts,
+                status="error",
+                error="items max length is 500",
+                http_status=400,
+            )
             raise HTTPException(status_code=400, detail="items max length is 500")
 
         shared_action = str(req.action or "").strip().lower() or None
@@ -385,7 +412,11 @@ def create_workflow_actions_router(
 
         for item in items:
             kind = normalize_inbox_kind(item.kind)
-            action = str(item.action or shared_action or default_inbox_action_for_kind(kind)).strip().lower()
+            action = (
+                str(item.action or shared_action or default_inbox_action_for_kind(kind))
+                .strip()
+                .lower()
+            )
             snooze_days = max(1, min(int(item.snooze_days or shared_snooze), 90))
             try:
                 payload = InboxActionRequestModel(
@@ -401,7 +432,9 @@ def create_workflow_actions_router(
                 )
                 result = apply_inbox_action_internal(payload)
                 success_count += 1
-                results.append({"success": True, "kind": kind, "action": action, "result": result})
+                results.append(
+                    {"success": True, "kind": kind, "action": action, "result": result}
+                )
             except HTTPException as e:
                 failure_count += 1
                 results.append(
@@ -415,7 +448,15 @@ def create_workflow_actions_router(
                 )
             except Exception as e:
                 failure_count += 1
-                results.append({"success": False, "kind": kind, "action": action, "status_code": 500, "error": str(e)})
+                results.append(
+                    {
+                        "success": False,
+                        "kind": kind,
+                        "action": action,
+                        "status_code": 500,
+                        "error": str(e),
+                    }
+                )
 
         payload = {
             "success_count": success_count,

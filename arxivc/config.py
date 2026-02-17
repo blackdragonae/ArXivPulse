@@ -1,5 +1,6 @@
 import json
 import os
+from typing import Optional
 
 CONFIG_FILE = "config.json"
 LOCAL_CONFIG_FILE = os.environ.get("ARXIVC_LOCAL_CONFIG_FILE", "config.local.json")
@@ -67,8 +68,8 @@ def save_config(
     keywords,
     vault_path="",
     warmup_models=DEFAULT_WARMUP_MODELS,
-    notion_token: str = None,
-    notion_database_id: str = None,
+    notion_token: Optional[str] = None,
+    notion_database_id: Optional[str] = None,
 ):
     global CATEGORIES, KEYWORDS, VAULT_PATH, WARMUP_MODELS, NOTION_TOKEN, NOTION_DATABASE_ID
     CATEGORIES = _coerce_string_list(categories, DEFAULT_CATEGORIES)
